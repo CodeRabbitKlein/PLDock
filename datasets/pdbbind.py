@@ -228,14 +228,23 @@ class PDBBind(Dataset):
         nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
             return
-        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if "cand_edge_index" in nci_labels:
+            edge_index = nci_labels["cand_edge_index"]
+        else:
+            edge_index = nci_labels.get("edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
             edge_index = edge_index.t()
-        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
-        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        if "cand_edge_y_type" in nci_labels:
+            edge_type = nci_labels["cand_edge_y_type"]
+        else:
+            edge_type = nci_labels.get("edge_type_y")
+        if "edge_y_dist" in nci_labels:
+            edge_dist = nci_labels["edge_y_dist"]
+        else:
+            edge_dist = nci_labels.get("edge_dist_y")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         nci_edge.edge_index = edge_index
         if edge_type is not None:
@@ -258,38 +267,6 @@ class PDBBind(Dataset):
                     data = np.load(path, allow_pickle=True)
                     return {key: data[key] for key in data.files}
         return None
-
-    def _report_nci_stats_once(self, complex_names):
-        if self.nci_cache_path is None:
-            return
-        for complex_name in complex_names:
-            nci_labels = self._load_nci_labels(str(complex_name))
-            if self._print_nci_edge_stats(complex_name, nci_labels):
-                break
-
-    @staticmethod
-    def _print_nci_edge_stats(complex_name, nci_labels):
-        if nci_labels is None:
-            return False
-        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
-        if edge_type is None:
-            return False
-        edge_type = np.asarray(edge_type)
-        num_cand_edges = edge_type.shape[0]
-        if num_cand_edges == 0:
-            pos_ratio = 0.0
-            none_ratio = 0.0
-            num_pos_edges = 0
-        else:
-            num_pos_edges = int((edge_type > 0).sum())
-            num_none_edges = int((edge_type == 0).sum())
-            pos_ratio = num_pos_edges / num_cand_edges
-            none_ratio = num_none_edges / num_cand_edges
-        print(
-            f"[NCI stats] {complex_name}: num_pos_edges={num_pos_edges}, "
-            f"num_cand_edges={num_cand_edges}, pos_ratio={pos_ratio:.4f}, none_ratio={none_ratio:.4f}"
-        )
-        return True
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
