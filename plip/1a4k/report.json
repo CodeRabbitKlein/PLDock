@@ -1,0 +1,406 @@
+{
+  "complex_pdb": "data\\plip\\1a4k\\complex.pdb",
+  "interaction_types": [
+    "hydrophobic",
+    "hbond",
+    "saltbridge",
+    "pistacking",
+    "pication",
+    "halogen",
+    "metal"
+  ],
+  "type_to_idx": {
+    "halogen": 0,
+    "hbond": 1,
+    "hydrophobic": 2,
+    "metal": 3,
+    "pication": 4,
+    "pistacking": 5,
+    "saltbridge": 6
+  },
+  "config_version": "1.0",
+  "binding_sites": {
+    "LIG:Z:1": {
+      "interactions": {
+        "hydrophobic": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "DIST",
+            "LIGCARBONIDX",
+            "PROTCARBONIDX",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": [
+            {
+              "RESNR": 47,
+              "RESTYPE": "TRP",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "3.90",
+              "LIGCARBONIDX": 6664,
+              "PROTCARBONIDX": 2034,
+              "LIGCOO": [
+                58.379,
+                60.728,
+                2.771
+              ],
+              "PROTCOO": [
+                59.989,
+                59.91,
+                6.229
+              ]
+            },
+            {
+              "RESNR": 50,
+              "RESTYPE": "TRP",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "3.43",
+              "LIGCARBONIDX": 6662,
+              "PROTCARBONIDX": 2062,
+              "LIGCOO": [
+                55.586,
+                54.726,
+                -0.37
+              ],
+              "PROTCOO": [
+                57.885,
+                53.882,
+                2.03
+              ]
+            },
+            {
+              "RESNR": 95,
+              "RESTYPE": "ALA",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "4.00",
+              "LIGCARBONIDX": 6663,
+              "PROTCARBONIDX": 2449,
+              "LIGCOO": [
+                56.442,
+                60.633,
+                1.087
+              ],
+              "PROTCOO": [
+                52.805,
+                60.338,
+                2.718
+              ]
+            },
+            {
+              "RESNR": 97,
+              "RESTYPE": "ARG",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "3.99",
+              "LIGCARBONIDX": 6662,
+              "PROTCARBONIDX": 2464,
+              "LIGCOO": [
+                55.586,
+                54.726,
+                -0.37
+              ],
+              "PROTCOO": [
+                55.639,
+                56.157,
+                -4.096
+              ]
+            },
+            {
+              "RESNR": 100,
+              "RESTYPE": "ARG",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "3.43",
+              "LIGCARBONIDX": 6665,
+              "PROTCARBONIDX": 2494,
+              "LIGCOO": [
+                57.493,
+                60.266,
+                -0.084
+              ],
+              "PROTCOO": [
+                57.381,
+                62.347,
+                -2.805
+              ]
+            },
+            {
+              "RESNR": 97,
+              "RESTYPE": "ARG",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "DIST": "3.67",
+              "LIGCARBONIDX": 6659,
+              "PROTCARBONIDX": 2463,
+              "LIGCOO": [
+                52.936,
+                55.675,
+                -0.545
+              ],
+              "PROTCOO": [
+                54.205,
+                56.616,
+                -3.861
+              ]
+            }
+          ]
+        },
+        "hbond": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "SIDECHAIN",
+            "DIST_H-A",
+            "DIST_D-A",
+            "DON_ANGLE",
+            "PROTISDON",
+            "DONORIDX",
+            "DONORTYPE",
+            "ACCEPTORIDX",
+            "ACCEPTORTYPE",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": [
+            {
+              "RESNR": 97,
+              "RESTYPE": "ARG",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "SIDECHAIN": false,
+              "DIST_H-A": "2.65",
+              "DIST_D-A": "3.63",
+              "DON_ANGLE": "171.26",
+              "PROTISDON": true,
+              "DONORIDX": 2459,
+              "DONORTYPE": "Nam",
+              "ACCEPTORIDX": 6650,
+              "ACCEPTORTYPE": "O2",
+              "LIGCOO": [
+                50.885,
+                55.115,
+                -2.659
+              ],
+              "PROTCOO": [
+                52.834,
+                58.174,
+                -2.579
+              ]
+            },
+            {
+              "RESNR": 35,
+              "RESTYPE": "ASN",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "SIDECHAIN": true,
+              "DIST_H-A": "1.93",
+              "DIST_D-A": "2.90",
+              "DON_ANGLE": "168.59",
+              "PROTISDON": true,
+              "DONORIDX": 1937,
+              "DONORTYPE": "Nam",
+              "ACCEPTORIDX": 6651,
+              "ACCEPTORTYPE": "O2",
+              "LIGCOO": [
+                55.039,
+                57.576,
+                2.753
+              ],
+              "PROTCOO": [
+                54.535,
+                58.6,
+                5.42
+              ]
+            }
+          ]
+        },
+        "saltbridge": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "PROT_IDX_LIST",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "DIST",
+            "PROTISPOS",
+            "LIG_GROUP",
+            "LIG_IDX_LIST",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": []
+        },
+        "pistacking": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "PROT_IDX_LIST",
+            "CENTDIST",
+            "ANGLE",
+            "OFFSET",
+            "TYPE",
+            "LIG_IDX_LIST",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": [
+            {
+              "RESNR": 50,
+              "RESTYPE": "TRP",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "PROT_IDX_LIST": "2054,2055,2056,2057,2058",
+              "CENTDIST": "4.02",
+              "ANGLE": "0.99",
+              "OFFSET": "1.75",
+              "TYPE": "P",
+              "LIG_IDX_LIST": "6656,6670,6671,6675,6676",
+              "LIGCOO": [
+                57.04979999999999,
+                57.662400000000005,
+                1.3761999999999999
+              ],
+              "PROTCOO": [
+                58.92819999999999,
+                55.9952,
+                4.5152
+              ]
+            },
+            {
+              "RESNR": 50,
+              "RESTYPE": "TRP",
+              "RESCHAIN": "H",
+              "RESNR_LIG": 1,
+              "RESTYPE_LIG": "LIG",
+              "RESCHAIN_LIG": "Z",
+              "PROT_IDX_LIST": "2056,2058,2059,2060,2061,2062",
+              "CENTDIST": "3.63",
+              "ANGLE": "1.08",
+              "OFFSET": "0.55",
+              "TYPE": "P",
+              "LIG_IDX_LIST": "6656,6670,6671,6675,6676",
+              "LIGCOO": [
+                57.04979999999999,
+                57.662400000000005,
+                1.3761999999999999
+              ],
+              "PROTCOO": [
+                57.885999999999996,
+                54.638,
+                3.1943333333333332
+              ]
+            }
+          ]
+        },
+        "pication": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "PROT_IDX_LIST",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "DIST",
+            "OFFSET",
+            "PROTCHARGED",
+            "LIG_GROUP",
+            "LIG_IDX_LIST",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": []
+        },
+        "halogen": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "SIDECHAIN",
+            "DIST",
+            "DON_ANGLE",
+            "ACC_ANGLE",
+            "DON_IDX",
+            "DONORTYPE",
+            "ACC_IDX",
+            "ACCEPTORTYPE",
+            "LIGCOO",
+            "PROTCOO"
+          ],
+          "records": []
+        },
+        "metal": {
+          "features": [
+            "RESNR",
+            "RESTYPE",
+            "RESCHAIN",
+            "RESNR_LIG",
+            "RESTYPE_LIG",
+            "RESCHAIN_LIG",
+            "METAL_IDX",
+            "METAL_TYPE",
+            "TARGET_IDX",
+            "TARGET_TYPE",
+            "COORDINATION",
+            "DIST",
+            "LOCATION",
+            "RMS",
+            "GEOMETRY",
+            "COMPLEXNUM",
+            "METALCOO",
+            "TARGETCOO"
+          ],
+          "records": []
+        }
+      }
+    }
+  },
+  "summary_counts": {
+    "hydrophobic": 6,
+    "hbond": 2,
+    "saltbridge": 0,
+    "pistacking": 2,
+    "pication": 0,
+    "halogen": 0,
+    "metal": 0
+  }
+}
