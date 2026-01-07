@@ -88,6 +88,8 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                     lig_idx_list = record.get("LIG_IDX_LIST")
                     if lig_idx_list:
                         lig_indices = parse_lig_idx_list(lig_idx_list, lig_pos.shape[0])
+                        if not lig_indices:
+                            lig_indices = None
 
                 if lig_indices is None:
                     lig_coord = record.get("LIGCOO")
