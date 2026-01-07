@@ -299,6 +299,16 @@ def _empty_nci_metrics(data_or_num_graphs, device, apply_mean):
     return zeros, zeros, zeros
 
 
+def _unpack_model_outputs(outputs):
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) == 5:
+            return outputs
+        if len(outputs) == 4:
+            tr_pred, rot_pred, tor_pred, sidechain_pred = outputs
+            return tr_pred, rot_pred, tor_pred, sidechain_pred, None
+    raise ValueError("Unexpected model output format; expected 4 or 5 outputs.")
+
+
 class AverageMeter():
     def __init__(self, types, unpooled_metrics=False, intervals=1):
         self.types = types
@@ -344,7 +354,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         optimizer.zero_grad()
         data = [d.to(device) for d in data] if device.type == 'cuda' else data
         try:
-            tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = model(data)
+            tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = _unpack_model_outputs(model(data))
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma,
                                  device=device, nci_logits=nci_logits)
             if loss_tuple is None:
@@ -401,7 +411,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     for data in tqdm(loader, total=len(loader)):
         try:
             with torch.no_grad():
-                tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = model(data)
+                tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = _unpack_model_outputs(model(data))
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma,
                                  apply_mean=False, device=device, nci_logits=nci_logits)
             if loss_tuple is None: continue
