@@ -258,9 +258,13 @@ def _compute_nci_batched(nci_logits, labels, edge_batch, num_graphs, device, app
     none_acc = none_correct_sum / (none_total + 1e-6)
 
     if apply_mean:
-        return loss_per_graph.mean() * torch.ones(1, dtype=torch.float, device=device), \
-            pos_recall.mean() * torch.ones(1, dtype=torch.float, device=device), \
-            none_acc.mean() * torch.ones(1, dtype=torch.float, device=device)
+        valid_mask = counts > 0
+        if not valid_mask.any():
+            zeros = torch.zeros(1, dtype=torch.float, device=device)
+            return zeros, zeros, zeros
+        return loss_per_graph[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device), \
+            pos_recall[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device), \
+            none_acc[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device)
     return loss_per_graph, pos_recall, none_acc
 
 
@@ -312,21 +316,6 @@ def _unpack_model_outputs(outputs):
             tr_pred, rot_pred, tor_pred, sidechain_pred = outputs
             return tr_pred, rot_pred, tor_pred, sidechain_pred, None
     raise ValueError("Unexpected model output format; expected 4 or 5 outputs.")
-
-
-def _compute_nci_per_graph(loss_out, metrics_out, labeled_mask, apply_mean=True):
-    if not apply_mean:
-        return loss_out, metrics_out
-    if labeled_mask is None or labeled_mask.numel() == 0:
-        return loss_out.mean(), {k: v.mean() for k, v in metrics_out.items()}
-    if labeled_mask.any():
-        loss_out = loss_out[labeled_mask].mean()
-        metrics_out = {k: v[labeled_mask].mean() for k, v in metrics_out.items()}
-    else:
-        zero = torch.tensor(0.0, device=loss_out.device)
-        loss_out = zero
-        metrics_out = {k: zero for k in metrics_out}
-    return loss_out, metrics_out
 
 
 class AverageMeter():
