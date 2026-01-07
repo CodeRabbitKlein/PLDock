@@ -96,6 +96,12 @@ class CGModel(torch.nn.Module):
             self.la_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(),nn.Dropout(dropout), nn.Linear(ns, ns))
 
         self.cross_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
+        self.nci_head = nn.Sequential(
+            nn.Linear(2 * ns + cross_distance_embed_dim, ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ns, 8)
+        )
 
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, rec_max_radius, distance_embed_dim)
@@ -324,6 +330,38 @@ class CGModel(torch.nn.Module):
             cross_cutoff = self.cross_max_distance
 
         lr_edge_index, lr_edge_attr, lr_edge_sh, rev_lr_edge_sh, lr_edge_weight = self.build_cross_conv_graph(data, cross_cutoff)
+
+        nci_logits = None
+        if ('ligand', 'nci_cand', 'receptor') in data.edge_types:
+            cand_edge_index = data['ligand', 'nci_cand', 'receptor'].edge_index
+            num_rec = rec_node_attr.size(0)
+            lr_keys = lr_edge_index[0] * num_rec + lr_edge_index[1]
+            cand_keys = cand_edge_index[0] * num_rec + cand_edge_index[1]
+            lr_sorted, lr_order = torch.sort(lr_keys)
+            if lr_sorted.numel() == 0:
+                valid = torch.zeros_like(cand_keys, dtype=torch.bool)
+                cand_pos = torch.zeros_like(cand_keys)
+            else:
+                cand_pos = torch.searchsorted(lr_sorted, cand_keys)
+                in_bounds = cand_pos < lr_sorted.numel()
+                valid = in_bounds.clone()
+                valid[in_bounds] = lr_sorted[cand_pos[in_bounds]] == cand_keys[in_bounds]
+
+            rbf = torch.zeros((cand_edge_index.size(1), self.cross_distance_embed_dim), device=lig_node_attr.device)
+            if valid.any():
+                rbf[valid] = lr_edge_attr[lr_order[cand_pos[valid]], self.sigma_embed_dim:]
+            if (~valid).any():
+                cand_edge_vec = data['receptor'].pos[cand_edge_index[1]] - data['ligand'].pos[cand_edge_index[0]]
+                cand_edge_length = self.cross_distance_expansion(cand_edge_vec.norm(dim=-1))
+                rbf[~valid] = cand_edge_length[~valid]
+
+            nci_input = torch.cat([
+                lig_node_attr[cand_edge_index[0]],
+                rec_node_attr[cand_edge_index[1]],
+                rbf
+            ], dim=-1)
+            nci_logits = self.nci_head(nci_input)
+
         lr_edge_attr = self.cross_edge_embedding(lr_edge_attr)
 
         node_attr = torch.cat([lig_node_attr, rec_node_attr], dim=0)
@@ -401,7 +439,8 @@ class CGModel(torch.nn.Module):
             sidechain_pred = self.sidechain_predictor(rec_node_attr)
             sidechain_pred = sidechain_pred[:, :10] + sidechain_pred[:, 10:] # sum even and odd components
 
-        if self.no_torsion or data['ligand'].edge_mask.sum() == 0: return tr_pred, rot_pred, torch.empty(0, device=self.device), sidechain_pred
+        if self.no_torsion or data['ligand'].edge_mask.sum() == 0:
+            return tr_pred, rot_pred, torch.empty(0, device=self.device), sidechain_pred, nci_logits
 
         # torsional components
         tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh, tor_edge_weight = self.build_bond_conv_graph(data)
@@ -421,7 +460,7 @@ class CGModel(torch.nn.Module):
         if self.scale_by_sigma:
             tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
                                              .to(data['ligand'].x.device))
-        return tr_pred, rot_pred, tor_pred, sidechain_pred
+        return tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits
 
     def torsional_forward(self, data):
         tor_sigma = self.t_to_sigma(data.complex_t['tor'])
@@ -637,4 +676,3 @@ class CGModel(torch.nn.Module):
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
         return bonds, edge_index, edge_attr, edge_sh, edge_weight
-
