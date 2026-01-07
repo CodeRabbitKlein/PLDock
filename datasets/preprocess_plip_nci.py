@@ -45,6 +45,9 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
     return None, float(dist)
 
 
+PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
+
+
 def parse_plip_records(report, lig_pos, res_key_to_idx):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
@@ -96,7 +99,8 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                     if lig_coord is None:
                         failed_records += 1
                         continue
-                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord)
+                    thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
+                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
                     if lig_idx is None:
                         failed_records += 1
                         continue

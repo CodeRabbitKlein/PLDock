@@ -314,6 +314,21 @@ def _unpack_model_outputs(outputs):
     raise ValueError("Unexpected model output format; expected 4 or 5 outputs.")
 
 
+def _compute_nci_per_graph(loss_out, metrics_out, labeled_mask, apply_mean=True):
+    if not apply_mean:
+        return loss_out, metrics_out
+    if labeled_mask is None or labeled_mask.numel() == 0:
+        return loss_out.mean(), {k: v.mean() for k, v in metrics_out.items()}
+    if labeled_mask.any():
+        loss_out = loss_out[labeled_mask].mean()
+        metrics_out = {k: v[labeled_mask].mean() for k, v in metrics_out.items()}
+    else:
+        zero = torch.tensor(0.0, device=loss_out.device)
+        loss_out = zero
+        metrics_out = {k: zero for k in metrics_out}
+    return loss_out, metrics_out
+
+
 class AverageMeter():
     def __init__(self, types, unpooled_metrics=False, intervals=1):
         self.types = types
