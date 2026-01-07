@@ -200,7 +200,7 @@ class CGOldModel(torch.nn.Module):
                     nn.Linear(ns, 1, bias=False)
                 )
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.no_aminoacid_identities:
             data['receptor'].x = data['receptor'].x * 0
 
@@ -297,6 +297,8 @@ class CGOldModel(torch.nn.Module):
         if self.confidence_mode:
             scalar_lig_attr = torch.cat([lig_node_attr[:,:self.ns],lig_node_attr[:,-self.ns:] ], dim=1) if self.num_conv_layers >= 3 else lig_node_attr[:,:self.ns]
             confidence = self.confidence_predictor(scatter_mean(scalar_lig_attr, data['ligand'].batch, dim=0)).squeeze(dim=-1)
+            if return_nci:
+                return confidence, None
             return confidence
 
         # compute translational and rotational score vectors
