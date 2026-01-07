@@ -295,14 +295,23 @@ class MOAD(Dataset):
         nci_labels = self._load_nci_labels(ligand_name)
         if nci_labels is None:
             return
-        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if "cand_edge_index" in nci_labels:
+            edge_index = nci_labels["cand_edge_index"]
+        else:
+            edge_index = nci_labels.get("edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
             edge_index = edge_index.t()
-        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
-        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        if "cand_edge_y_type" in nci_labels:
+            edge_type = nci_labels["cand_edge_y_type"]
+        else:
+            edge_type = nci_labels.get("edge_type_y")
+        if "edge_y_dist" in nci_labels:
+            edge_dist = nci_labels["edge_y_dist"]
+        else:
+            edge_dist = nci_labels.get("edge_dist_y")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         nci_edge.edge_index = edge_index
         if edge_type is not None:
@@ -459,6 +468,7 @@ class MOAD(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
+        self._report_nci_stats_once(complex_names_all)
 
         # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
         list_indices = list(range(len(complex_names_all)//1000+1))
