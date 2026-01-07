@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning,
 import numpy as np
 import pandas as pd
 import torch
+from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 
 from rdkit import RDLogger
@@ -40,9 +41,10 @@ from utils.logging_utils import configure_logger, get_logger
 import utils.utils
 from datasets.process_mols import write_mol_with_coords
 from utils.download import download_and_extract
-from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
+from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule, set_time
 from utils.inference_utils import InferenceDataset, set_nones
 from utils.sampling import randomize_position, sampling
+from utils.molecules_utils import get_symmetry_rmsd
 from utils.utils import get_model
 from utils.visualise import PDBFile
 from tqdm import tqdm
@@ -57,6 +59,27 @@ prody_logger.setLevel(logging.ERROR)
 REPOSITORY_URL = os.environ.get("REPOSITORY_URL", "https://github.com/gcorso/DiffDock")
 REMOTE_URLS = [f"{REPOSITORY_URL}/releases/latest/download/diffdock_models.zip",
                f"{REPOSITORY_URL}/releases/download/v1.1/diffdock_models.zip"]
+
+
+def build_nci_edges(complex_graph, cutoff=10.0):
+    lig_pos = complex_graph['ligand'].pos
+    rec_pos = complex_graph['receptor'].pos
+    dist = torch.cdist(lig_pos, rec_pos)
+    mask = dist <= cutoff
+    if mask.any():
+        lig_idx, rec_idx = mask.nonzero(as_tuple=True)
+        edge_index = torch.stack([lig_idx, rec_idx], dim=0)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=lig_pos.device)
+    complex_graph['ligand', 'nci_cand', 'receptor'].edge_index = edge_index
+    return edge_index
+
+
+def compute_pose_rmsds(mol, ref_pos, pose_positions):
+    rmsds = []
+    for pose in pose_positions:
+        rmsds.append(get_symmetry_rmsd(mol, ref_pos, pose))
+    return np.asarray(rmsds)
 
 
 def get_parser():
@@ -292,6 +315,7 @@ def main(args):
     N = args.samples_per_complex
     test_ds_size = len(test_dataset)
     logger.info(f'Size of test dataset: {test_ds_size}')
+    rerank_reported = 0
     for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
         if not orig_complex_graph.success[0]:
             skipped += 1
@@ -341,9 +365,36 @@ def main(args):
                                              temp_sigma_data=[args.temp_sigma_data_tr, args.temp_sigma_data_rot,
                                                               args.temp_sigma_data_tor])
 
-            ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in data_list])
+            ligand_pos_rel = np.asarray([complex_graph['ligand'].pos.cpu().numpy() for complex_graph in data_list])
+            ligand_pos = np.asarray(
+                [complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy()
+                 for complex_graph in data_list]
+            )
+            ligand_pos_rel_raw = ligand_pos_rel.copy()
+            ligand_pos_raw = ligand_pos.copy()
+            rmsds_raw = None
+            mol_for_rmsd = None
+            ref_positions = None
+            if hasattr(orig_complex_graph['ligand'], 'orig_pos'):
+                ref_positions = np.asarray(orig_complex_graph['ligand'].orig_pos)
+                if ref_positions.ndim == 2:
+                    ref_positions = ref_positions[None, :, :]
+                mol_for_rmsd = copy.deepcopy(lig)
+                if score_model_args.remove_hs:
+                    mol_for_rmsd = RemoveAllHs(mol_for_rmsd)
+                filter_hs = torch.not_equal(data_list[0]['ligand'].x[:, 0], 0).cpu().numpy()
+                try:
+                    ligand_pos_rel_raw = ligand_pos_rel_raw[:, filter_hs]
+                    ref_positions = ref_positions[:, filter_hs] - orig_complex_graph.original_center.cpu().numpy()
+                    complex_rmsds = []
+                    for i in range(ref_positions.shape[0]):
+                        complex_rmsds.append(compute_pose_rmsds(mol_for_rmsd, ref_positions[i], ligand_pos_rel_raw))
+                    rmsds_raw = np.min(np.asarray(complex_rmsds), axis=0)
+                except Exception as e:
+                    logger.warning(f"Failed to compute RMSDs for {orig_complex_graph['name']}: {e}")
 
             # reorder predictions based on confidence output
+            nci_scores = None
             if confidence is not None and isinstance(confidence_args.rmsd_classification_cutoff, list):
                 confidence = confidence[:, 0]
             if confidence is not None:
@@ -351,6 +402,68 @@ def main(args):
                 re_order = np.argsort(confidence)[::-1]
                 confidence = confidence[re_order]
                 ligand_pos = ligand_pos[re_order]
+                ligand_pos_rel = ligand_pos_rel[re_order]
+                data_list = [data_list[i] for i in re_order]
+                if confidence_data_list is not None:
+                    confidence_data_list = [confidence_data_list[i] for i in re_order]
+
+                if confidence_model is not None:
+                    nci_scores = []
+                    include_misc = bool(getattr(confidence_args, 'include_miscellaneous_atoms', False))
+                    base_graphs = confidence_data_list if confidence_data_list is not None else data_list
+                    with torch.no_grad():
+                        for pose_idx, base_graph in enumerate(base_graphs):
+                            pose_graph = copy.deepcopy(base_graph)
+                            pose_graph['ligand'].pos = data_list[pose_idx]['ligand'].pos
+                            pose_graph = Batch.from_data_list([pose_graph]).to(device)
+                            set_time(pose_graph, 0, 0, 0, 0, 1, confidence_args.all_atoms, device, include_misc)
+                            edge_index = build_nci_edges(pose_graph, cutoff=10.0)
+                            if edge_index.size(1) == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            out = confidence_model(pose_graph, return_nci=True)
+                            nci_logits = None
+                            if isinstance(out, tuple):
+                                if len(out) >= 3:
+                                    nci_logits = out[2]
+                                elif len(out) == 2:
+                                    nci_logits = out[1]
+                            if nci_logits is None or nci_logits.numel() == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            probs = torch.softmax(nci_logits, dim=-1)
+                            conf_edge = probs[:, 1:].max(dim=-1).values
+                            if conf_edge.numel() == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            top_k = min(50, conf_edge.numel())
+                            top_conf = torch.topk(conf_edge, top_k).values
+                            nci_scores.append(torch.log(top_conf + 1e-6).mean())
+
+                    nci_scores = torch.stack(nci_scores).cpu().numpy()
+                    score_final = confidence + 0.1 * nci_scores
+                    final_order = np.argsort(score_final)[::-1]
+                    confidence = confidence[final_order]
+                    ligand_pos = ligand_pos[final_order]
+                    ligand_pos_rel = ligand_pos_rel[final_order]
+                    nci_scores = nci_scores[final_order]
+                    data_list = [data_list[i] for i in final_order]
+                    if confidence_data_list is not None:
+                        confidence_data_list = [confidence_data_list[i] for i in final_order]
+                    re_order = re_order[final_order]
+
+            if rmsds_raw is not None and confidence is not None and rerank_reported < 10:
+                rmsds_rerank = rmsds_raw[re_order]
+                top1_raw = rmsds_raw[0]
+                top5_raw = np.min(rmsds_raw[:min(5, rmsds_raw.shape[0])])
+                top1_rerank = rmsds_rerank[0]
+                top5_rerank = np.min(rmsds_rerank[:min(5, rmsds_rerank.shape[0])])
+                print(
+                    f"[Rerank RMSD] {orig_complex_graph['name']}: "
+                    f"raw_top1={top1_raw:.3f}, raw_top5={top5_raw:.3f}, "
+                    f"rerank_top1={top1_rerank:.3f}, rerank_top5={top5_rerank:.3f}"
+                )
+                rerank_reported += 1
 
             # save predictions
             write_dir = f'{args.out_dir}/{complex_name_list[idx]}'
@@ -358,7 +471,14 @@ def main(args):
                 mol_pred = copy.deepcopy(lig)
                 if score_model_args.remove_hs: mol_pred = RemoveAllHs(mol_pred)
                 if rank == 0: write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}.sdf'))
-                write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}.sdf'))
+                if nci_scores is not None:
+                    write_mol_with_coords(
+                        mol_pred,
+                        pos,
+                        os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}_nci{nci_scores[rank]:.3f}.sdf')
+                    )
+                else:
+                    write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}.sdf'))
 
             # save visualisation frames
             if args.save_visualisation:
