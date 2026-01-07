@@ -1,6 +1,7 @@
+import copy
 import os
 from esm import FastaBatchedDataset, pretrained
-from rdkit.Chem import AddHs, MolFromSmiles
+from rdkit.Chem import AddHs, MolFromSmiles, RemoveHs
 from torch_geometric.data import Dataset, HeteroData
 import numpy as np
 import torch
@@ -346,6 +347,11 @@ class InferenceDataset(Dataset):
                 mol = read_molecule(ligand_description, remove_hs=False, sanitize=True)
                 if mol is None:
                     raise Exception('RDKit could not read the molecule ', ligand_description)
+                ref_mol = copy.deepcopy(mol)
+                if ref_mol.GetNumConformers() > 0:
+                    if self.remove_hs:
+                        ref_mol = RemoveHs(ref_mol, sanitize=True)
+                    complex_graph['ligand'].orig_pos = np.asarray(ref_mol.GetConformer().GetPositions())
                 mol.RemoveAllConformers()
                 mol = AddHs(mol)
                 generate_conformer(mol)

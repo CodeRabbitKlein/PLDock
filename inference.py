@@ -44,6 +44,7 @@ from utils.download import download_and_extract
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule, set_time
 from utils.inference_utils import InferenceDataset, set_nones
 from utils.sampling import randomize_position, sampling
+from utils.molecules_utils import get_symmetry_rmsd
 from utils.utils import get_model
 from utils.visualise import PDBFile
 from tqdm import tqdm
@@ -307,6 +308,7 @@ def main(args):
     N = args.samples_per_complex
     test_ds_size = len(test_dataset)
     logger.info(f'Size of test dataset: {test_ds_size}')
+    rerank_reported = 0
     for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
         if not orig_complex_graph.success[0]:
             skipped += 1
@@ -356,7 +358,33 @@ def main(args):
                                              temp_sigma_data=[args.temp_sigma_data_tr, args.temp_sigma_data_rot,
                                                               args.temp_sigma_data_tor])
 
-            ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in data_list])
+            ligand_pos_rel = np.asarray([complex_graph['ligand'].pos.cpu().numpy() for complex_graph in data_list])
+            ligand_pos = np.asarray(
+                [complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy()
+                 for complex_graph in data_list]
+            )
+            ligand_pos_rel_raw = ligand_pos_rel.copy()
+            ligand_pos_raw = ligand_pos.copy()
+            rmsds_raw = None
+            mol_for_rmsd = None
+            ref_positions = None
+            if hasattr(orig_complex_graph['ligand'], 'orig_pos'):
+                ref_positions = np.asarray(orig_complex_graph['ligand'].orig_pos)
+                if ref_positions.ndim == 2:
+                    ref_positions = ref_positions[None, :, :]
+                mol_for_rmsd = copy.deepcopy(lig)
+                if score_model_args.remove_hs:
+                    mol_for_rmsd = RemoveAllHs(mol_for_rmsd)
+                filter_hs = torch.not_equal(data_list[0]['ligand'].x[:, 0], 0).cpu().numpy()
+                try:
+                    ligand_pos_rel_raw = ligand_pos_rel_raw[:, filter_hs]
+                    ref_positions = ref_positions[:, filter_hs] - orig_complex_graph.original_center.cpu().numpy()
+                    complex_rmsds = []
+                    for i in range(ref_positions.shape[0]):
+                        complex_rmsds.append(compute_pose_rmsds(mol_for_rmsd, ref_positions[i], ligand_pos_rel_raw))
+                    rmsds_raw = np.min(np.asarray(complex_rmsds), axis=0)
+                except Exception as e:
+                    logger.warning(f"Failed to compute RMSDs for {orig_complex_graph['name']}: {e}")
 
             # reorder predictions based on confidence output
             nci_scores = None

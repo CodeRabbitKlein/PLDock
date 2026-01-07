@@ -259,6 +259,38 @@ class PDBBind(Dataset):
                     return {key: data[key] for key in data.files}
         return None
 
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        for complex_name in complex_names:
+            nci_labels = self._load_nci_labels(str(complex_name))
+            if self._print_nci_edge_stats(complex_name, nci_labels):
+                break
+
+    @staticmethod
+    def _print_nci_edge_stats(complex_name, nci_labels):
+        if nci_labels is None:
+            return False
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        if edge_type is None:
+            return False
+        edge_type = np.asarray(edge_type)
+        num_cand_edges = edge_type.shape[0]
+        if num_cand_edges == 0:
+            pos_ratio = 0.0
+            none_ratio = 0.0
+            num_pos_edges = 0
+        else:
+            num_pos_edges = int((edge_type > 0).sum())
+            num_none_edges = int((edge_type == 0).sum())
+            pos_ratio = num_pos_edges / num_cand_edges
+            none_ratio = num_none_edges / num_cand_edges
+        print(
+            f"[NCI stats] {complex_name}: num_pos_edges={num_pos_edges}, "
+            f"num_cand_edges={num_cand_edges}, pos_ratio={pos_ratio:.4f}, none_ratio={none_ratio:.4f}"
+        )
+        return True
+
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
 
@@ -266,6 +298,7 @@ class PDBBind(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
+        self._report_nci_stats_once(complex_names_all)
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
@@ -308,8 +341,8 @@ class PDBBind(Dataset):
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+            pickle.dump((rdkit_ligands), f)
 
     def inference_preprocessing(self):
         ligands_list = []
