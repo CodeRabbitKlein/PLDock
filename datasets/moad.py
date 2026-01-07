@@ -326,6 +326,38 @@ class MOAD(Dataset):
                     return {key: data[key] for key in data.files}
         return None
 
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        for ligand_name in complex_names:
+            nci_labels = self._load_nci_labels(ligand_name)
+            if self._print_nci_edge_stats(ligand_name, nci_labels):
+                break
+
+    @staticmethod
+    def _print_nci_edge_stats(ligand_name, nci_labels):
+        if nci_labels is None:
+            return False
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        if edge_type is None:
+            return False
+        edge_type = np.asarray(edge_type)
+        num_cand_edges = edge_type.shape[0]
+        if num_cand_edges == 0:
+            pos_ratio = 0.0
+            none_ratio = 0.0
+            num_pos_edges = 0
+        else:
+            num_pos_edges = int((edge_type > 0).sum())
+            num_none_edges = int((edge_type == 0).sum())
+            pos_ratio = num_pos_edges / num_cand_edges
+            none_ratio = num_none_edges / num_cand_edges
+        print(
+            f"[NCI stats] {ligand_name}: num_pos_edges={num_pos_edges}, "
+            f"num_cand_edges={num_cand_edges}, pos_ratio={pos_ratio:.4f}, none_ratio={none_ratio:.4f}"
+        )
+        return True
+
     def preprocessing_receptors(self):
         print(f'Processing receptors from [{self.split}] and saving it to [{self.prot_cache_path}]')
 
@@ -459,6 +491,7 @@ class MOAD(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
+        self._report_nci_stats_once(complex_names_all)
 
         # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
         list_indices = list(range(len(complex_names_all)//1000+1))
