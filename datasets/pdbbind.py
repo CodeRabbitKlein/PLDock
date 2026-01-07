@@ -275,6 +275,7 @@ class PDBBind(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
+        self._report_nci_stats_once(complex_names_all)
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
@@ -317,8 +318,8 @@ class PDBBind(Dataset):
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+            pickle.dump((rdkit_ligands), f)
 
     def inference_preprocessing(self):
         ligands_list = []

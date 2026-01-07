@@ -4,6 +4,7 @@ from rdkit.Chem import RemoveAllHs
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 
 from confidence.dataset import ListDataset
 from utils import so3, torus
@@ -13,7 +14,8 @@ from utils.diffusion_utils import get_t_schedule
 
 
 def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device, tr_weight=1, rot_weight=1,
-                  tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False):
+                  tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False,
+                  nci_logits=None, nci_labels=None, nci_loss_weight=1.0):
     tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
         *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
           for noise_type in ['tr', 'rot', 'tor']])
@@ -119,9 +121,182 @@ def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma,
             sidechain_loss, sidechain_base_loss = torch.zeros(len(rot_loss), dtype=torch.float), torch.zeros(
                 len(rot_loss), dtype=torch.float)
 
-    loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight + sidechain_loss * sidechain_weight + backbone_loss * backbone_weight
+    nci_loss, pos_recall, none_acc = _nci_loss_and_metrics(
+        nci_logits=nci_logits,
+        nci_labels=nci_labels,
+        data=data,
+        device=device,
+        apply_mean=apply_mean
+    )
+    nci_loss = nci_loss.cpu()
+    pos_recall = pos_recall.cpu()
+    none_acc = none_acc.cpu()
+
+    loss_diff = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight + \
+        sidechain_loss * sidechain_weight + backbone_loss * backbone_weight
+    loss = loss_diff + nci_loss_weight * nci_loss
     return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), backbone_loss.detach(), sidechain_loss.detach(), \
-           tr_base_loss, rot_base_loss, tor_base_loss, backbone_base_loss, sidechain_base_loss
+           nci_loss.detach(), pos_recall.detach(), none_acc.detach(), tr_base_loss, rot_base_loss, tor_base_loss, \
+           backbone_base_loss, sidechain_base_loss
+
+
+def _nci_loss_and_metrics(nci_logits, nci_labels, data, device, apply_mean, alpha_none=0.25, alpha_pos=1.0, gamma=2.0):
+    if nci_logits is None:
+        return _empty_nci_metrics(data, device, apply_mean)
+
+    labels = _resolve_nci_labels(data, nci_labels, device)
+    if labels is None:
+        return _empty_nci_metrics(data, device, apply_mean)
+
+    if device.type == 'cuda':
+        logits_per_graph = _split_nci_logits(nci_logits, data)
+        labels_per_graph = _split_nci_labels(labels, data)
+        return _compute_nci_per_graph(logits_per_graph, labels_per_graph, device, apply_mean,
+                                      alpha_none=alpha_none, alpha_pos=alpha_pos, gamma=gamma)
+
+    edge_batch = data['ligand'].batch[data['ligand', 'nci_cand', 'receptor'].edge_index[0]]
+    num_graphs = data.num_graphs
+    return _compute_nci_batched(nci_logits, labels, edge_batch, num_graphs, device, apply_mean,
+                                alpha_none=alpha_none, alpha_pos=alpha_pos, gamma=gamma)
+
+
+def _resolve_nci_labels(data, nci_labels, device):
+    if nci_labels is not None:
+        return nci_labels
+    if device.type == 'cuda':
+        labels = []
+        for d in data:
+            if ('ligand', 'nci_cand', 'receptor') in d.edge_types and \
+                    hasattr(d['ligand', 'nci_cand', 'receptor'], 'edge_type_y'):
+                labels.append(d['ligand', 'nci_cand', 'receptor'].edge_type_y)
+            else:
+                labels.append(None)
+        if all(l is None for l in labels):
+            return None
+        return labels
+    if ('ligand', 'nci_cand', 'receptor') not in data.edge_types:
+        return None
+    if not hasattr(data['ligand', 'nci_cand', 'receptor'], 'edge_type_y'):
+        return None
+    return data['ligand', 'nci_cand', 'receptor'].edge_type_y
+
+
+def _split_nci_logits(nci_logits, data):
+    edge_counts = []
+    for d in data:
+        if ('ligand', 'nci_cand', 'receptor') in d.edge_types:
+            edge_counts.append(d['ligand', 'nci_cand', 'receptor'].edge_index.size(1))
+        else:
+            edge_counts.append(0)
+    if nci_logits.numel() == 0:
+        return [nci_logits] * len(edge_counts)
+    return list(torch.split(nci_logits, edge_counts, dim=0))
+
+
+def _split_nci_labels(labels, data):
+    if isinstance(labels, (list, tuple)):
+        return list(labels)
+    edge_counts = []
+    for d in data:
+        if ('ligand', 'nci_cand', 'receptor') in d.edge_types:
+            edge_counts.append(d['ligand', 'nci_cand', 'receptor'].edge_index.size(1))
+        else:
+            edge_counts.append(0)
+    if labels.numel() == 0:
+        return [labels] * len(edge_counts)
+    return list(torch.split(labels, edge_counts, dim=0))
+
+
+def _compute_nci_per_graph(logits_per_graph, labels_per_graph, device, apply_mean, alpha_none, alpha_pos, gamma):
+    num_graphs = len(logits_per_graph)
+    loss_out = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    pos_recall = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    none_acc = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    for i, (logits, labels) in enumerate(zip(logits_per_graph, labels_per_graph)):
+        if labels is None or logits is None or labels.numel() == 0:
+            continue
+        loss_i, pos_recall_i, none_acc_i = _compute_nci_single(logits, labels, alpha_none, alpha_pos, gamma)
+        loss_out[i] = loss_i
+        pos_recall[i] = pos_recall_i
+        none_acc[i] = none_acc_i
+    if apply_mean:
+        return loss_out.mean() * torch.ones(1, dtype=torch.float, device=device), \
+            pos_recall.mean() * torch.ones(1, dtype=torch.float, device=device), \
+            none_acc.mean() * torch.ones(1, dtype=torch.float, device=device)
+    return loss_out, pos_recall, none_acc
+
+
+def _compute_nci_batched(nci_logits, labels, edge_batch, num_graphs, device, apply_mean, alpha_none, alpha_pos, gamma):
+    if labels is None or nci_logits is None or labels.numel() == 0:
+        return _empty_nci_metrics(num_graphs, device, apply_mean)
+    focal_loss = _focal_loss(nci_logits, labels, alpha_none, alpha_pos, gamma)
+    loss_sum = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    counts = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    loss_sum.index_add_(0, edge_batch, focal_loss)
+    counts.index_add_(0, edge_batch, torch.ones_like(focal_loss))
+    loss_per_graph = loss_sum / (counts + 1e-6)
+
+    preds = torch.argmax(nci_logits, dim=1)
+    pos_mask = labels > 0
+    none_mask = labels == 0
+    pos_correct = ((preds == labels) & pos_mask).float()
+    none_correct = ((preds == 0) & none_mask).float()
+    pos_total = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    none_total = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    pos_correct_sum = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    none_correct_sum = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    pos_total.index_add_(0, edge_batch, pos_mask.float())
+    none_total.index_add_(0, edge_batch, none_mask.float())
+    pos_correct_sum.index_add_(0, edge_batch, pos_correct)
+    none_correct_sum.index_add_(0, edge_batch, none_correct)
+    pos_recall = pos_correct_sum / (pos_total + 1e-6)
+    none_acc = none_correct_sum / (none_total + 1e-6)
+
+    if apply_mean:
+        return loss_per_graph.mean() * torch.ones(1, dtype=torch.float, device=device), \
+            pos_recall.mean() * torch.ones(1, dtype=torch.float, device=device), \
+            none_acc.mean() * torch.ones(1, dtype=torch.float, device=device)
+    return loss_per_graph, pos_recall, none_acc
+
+
+def _compute_nci_single(logits, labels, alpha_none, alpha_pos, gamma):
+    focal_loss = _focal_loss(logits, labels, alpha_none, alpha_pos, gamma)
+    loss = focal_loss.mean()
+    preds = torch.argmax(logits, dim=1)
+    pos_mask = labels > 0
+    none_mask = labels == 0
+    pos_correct = ((preds == labels) & pos_mask).float().sum()
+    none_correct = ((preds == 0) & none_mask).float().sum()
+    pos_recall = pos_correct / (pos_mask.float().sum() + 1e-6)
+    none_acc = none_correct / (none_mask.float().sum() + 1e-6)
+    return loss, pos_recall, none_acc
+
+
+def _focal_loss(logits, labels, alpha_none, alpha_pos, gamma):
+    log_probs = F.log_softmax(logits, dim=1)
+    probs = torch.exp(log_probs)
+    labels = labels.long()
+    log_pt = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    pt = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    alpha = torch.where(labels == 0,
+                        torch.full_like(labels, alpha_none, dtype=logits.dtype),
+                        torch.full_like(labels, alpha_pos, dtype=logits.dtype))
+    focal_term = (1 - pt) ** gamma
+    return -alpha * focal_term * log_pt
+
+
+def _empty_nci_metrics(data_or_num_graphs, device, apply_mean):
+    if isinstance(data_or_num_graphs, int):
+        num_graphs = data_or_num_graphs
+    elif device.type == 'cuda':
+        num_graphs = len(data_or_num_graphs)
+    else:
+        num_graphs = data_or_num_graphs.num_graphs
+    if apply_mean:
+        zeros = torch.zeros(1, dtype=torch.float, device=device)
+        return zeros, zeros, zeros
+    zeros = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    return zeros, zeros, zeros
 
 
 class AverageMeter():
@@ -159,7 +334,8 @@ class AverageMeter():
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights):
     model.train()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
+                          'nci_loss', 'pos_recall', 'none_acc', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss',
+                          'backbone_base_loss', 'sidechain_base_loss'])
 
     for data in tqdm(loader, total=len(loader)):
         if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
@@ -168,8 +344,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         optimizer.zero_grad()
         data = [d.to(device) for d in data] if device.type == 'cuda' else data
         try:
-            tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)
+            tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = model(data)
+            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma,
+                                 device=device, nci_logits=nci_logits)
             if loss_tuple is None:
                 print("None loss tuple, skipping")
                 continue
@@ -210,20 +387,23 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-                          'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+                          'nci_loss', 'pos_recall', 'none_acc', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss',
+                          'backbone_base_loss', 'sidechain_base_loss'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
         meter_all = AverageMeter(
             ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
-             'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'],
+             'nci_loss', 'pos_recall', 'none_acc', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss',
+             'backbone_base_loss', 'sidechain_base_loss'],
             unpooled_metrics=True, intervals=10)
 
     for data in tqdm(loader, total=len(loader)):
         try:
             with torch.no_grad():
-                tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+                tr_pred, rot_pred, tor_pred, sidechain_pred, nci_logits = model(data)
+            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma,
+                                 apply_mean=False, device=device, nci_logits=nci_logits)
             if loss_tuple is None: continue
             meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
 
@@ -235,7 +415,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 sigma_index_tor = torch.round(complex_t_tor.cpu() * (10 - 1)).long()
                 meter_all.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]],
                     [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr,
-                     sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_tr])
+                     sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor,
+                     sigma_index_tr, sigma_index_tr])
 
         except RuntimeError as e:
             if 'out of memory' in str(e):
