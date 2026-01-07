@@ -25,7 +25,8 @@ class MOAD(Dataset):
                  include_miscellaneous_atoms=False, keep_local_structures=False,
                  min_ligand_size=0, knn_only_graph=False, matching_tries=1, multiplicity=1,
                  max_receptor_size=None, remove_promiscuous_targets=None, unroll_clusters=False, remove_pdbbind=False,
-                 enforce_timesplit=False, no_randomness=False, single_cluster_name=None, total_dataset_size=None, skip_matching=False):
+                 enforce_timesplit=False, no_randomness=False, single_cluster_name=None, total_dataset_size=None, skip_matching=False,
+                 nci_cache_path=None):
 
         super(MOAD, self).__init__(root, transform)
         self.moad_dir = root
@@ -49,13 +50,15 @@ class MOAD(Dataset):
         self.no_randomness = no_randomness
         self.total_dataset_size = total_dataset_size
         self.skip_matching = skip_matching
+        self.nci_cache_path = nci_cache_path
 
         self.prot_cache_path = os.path.join(cache_path, f'MOAD12_limit{self.limit_complexes}_INDEX{self.split}'
                                                         f'_recRad{self.receptor_radius}_recMax{self.c_alpha_max_neighbors}'
                                             + (''if not all_atoms else f'_atomRad{atom_radius}_atomMax{atom_max_neighbors}')
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not self.include_miscellaneous_atoms else '_miscAtoms')
-                                            + ('' if not self.knn_only_graph else '_knnOnly'))
+                                            + ('' if not self.knn_only_graph else '_knnOnly')
+                                            + ('' if self.nci_cache_path is None else '_nci'))
 
         self.lig_cache_path = os.path.join(cache_path, f'MOAD12_limit{self.limit_complexes}_INDEX{self.split}'
                                                         f'_maxLigSize{self.max_lig_size}_H{int(not self.remove_hs)}'
@@ -63,7 +66,8 @@ class MOAD(Dataset):
                                             + ('' if not skip_matching else f'skip')
                                             + (''if not matching or num_conformers == 1 else f'_confs{num_conformers}')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
-                                            + ('' if self.matching_tries == 1 else f'_tries{matching_tries}'))
+                                            + ('' if self.matching_tries == 1 else f'_tries{matching_tries}')
+                                            + ('' if self.nci_cache_path is None else '_nci'))
 
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
@@ -256,6 +260,7 @@ class MOAD(Dataset):
             if hasattr(complex_graph['receptor'], a):
                 delattr(complex_graph['receptor'], a)
 
+        self._add_nci_edges(complex_graph, ligand_name)
         return complex_graph
 
     def get(self, idx):
@@ -283,6 +288,75 @@ class MOAD(Dataset):
             for ligand_name in self.cluster_to_ligands[cluster]:
                 complexes[ligand_name] = self.get_by_name(ligand_name, cluster)
         return complexes
+
+    def _add_nci_edges(self, complex_graph, ligand_name):
+        if self.nci_cache_path is None:
+            return
+        nci_labels = self._load_nci_labels(ligand_name)
+        if nci_labels is None:
+            return
+        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if edge_index is None:
+            return
+        edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
+            edge_index = edge_index.t()
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        nci_edge.edge_index = edge_index
+        if edge_type is not None:
+            nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
+        if edge_dist is not None:
+            nci_edge.edge_dist_y = torch.as_tensor(edge_dist, dtype=torch.float32)
+
+    def _load_nci_labels(self, ligand_name):
+        if self.nci_cache_path is None:
+            return None
+        candidates = []
+        if ligand_name:
+            candidates.extend([ligand_name, ligand_name[:4], ligand_name[:6]])
+        for candidate in dict.fromkeys(candidates):
+            for ext in (".pt", ".npz"):
+                path = os.path.join(self.nci_cache_path, f"{candidate}{ext}")
+                if os.path.exists(path):
+                    if ext == ".pt":
+                        return torch.load(path, map_location="cpu")
+                    data = np.load(path, allow_pickle=True)
+                    return {key: data[key] for key in data.files}
+        return None
+
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        for ligand_name in complex_names:
+            nci_labels = self._load_nci_labels(ligand_name)
+            if self._print_nci_edge_stats(ligand_name, nci_labels):
+                break
+
+    @staticmethod
+    def _print_nci_edge_stats(ligand_name, nci_labels):
+        if nci_labels is None:
+            return False
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        if edge_type is None:
+            return False
+        edge_type = np.asarray(edge_type)
+        num_cand_edges = edge_type.shape[0]
+        if num_cand_edges == 0:
+            pos_ratio = 0.0
+            none_ratio = 0.0
+            num_pos_edges = 0
+        else:
+            num_pos_edges = int((edge_type > 0).sum())
+            num_none_edges = int((edge_type == 0).sum())
+            pos_ratio = num_pos_edges / num_cand_edges
+            none_ratio = num_none_edges / num_cand_edges
+        print(
+            f"[NCI stats] {ligand_name}: num_pos_edges={num_pos_edges}, "
+            f"num_cand_edges={num_cand_edges}, pos_ratio={pos_ratio:.4f}, none_ratio={none_ratio:.4f}"
+        )
+        return True
 
     def preprocessing_receptors(self):
         print(f'Processing receptors from [{self.split}] and saving it to [{self.prot_cache_path}]')
@@ -417,6 +491,7 @@ class MOAD(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
+        self._report_nci_stats_once(complex_names_all)
 
         # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
         list_indices = list(range(len(complex_names_all)//1000+1))
@@ -544,4 +619,3 @@ def print_statistics(dataset):
         print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
 
     return
-

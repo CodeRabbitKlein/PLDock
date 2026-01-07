@@ -77,6 +77,8 @@ def construct_loader(args, t_to_sigma, device):
                        'knn_only_graph': False if not hasattr(args, 'not_knn_only_graph') else not args.not_knn_only_graph,
                        'include_miscellaneous_atoms': False if not hasattr(args, 'include_miscellaneous_atoms') else args.include_miscellaneous_atoms,
                        'matching_tries': args.matching_tries}
+        if hasattr(args, 'nci_cache_path'):
+            common_args['nci_cache_path'] = args.nci_cache_path
 
         if args.dataset == 'pdbbind' or args.dataset == 'generalisation' or args.combined_training:
             train_dataset = PDBBind(cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
@@ -120,4 +122,3 @@ def construct_loader(args, t_to_sigma, device):
     train_loader = loader_class(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=True, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
     val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory, drop_last=args.dataloader_drop_last)
     return train_loader, val_loader, val_dataset2
-

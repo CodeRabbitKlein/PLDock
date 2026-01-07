@@ -152,6 +152,7 @@ def parse_train_args():
     parser.add_argument('--embed_also_ligand', action='store_true', default=True, help='')
     parser.add_argument('--sidechain_loss_weight', type=float, default=0, help='')
     parser.add_argument('--backbone_loss_weight', type=float, default=0, help='')
+    parser.add_argument('--nci_loss_weight', type=float, default=1.0, help='')
 
     # pdb sidechain training
     parser.add_argument('--pdbsidechain_dir', type=str, default='data/pdb_2021aug02_sample', help='')

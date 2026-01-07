@@ -134,7 +134,7 @@ class PDBBind(Dataset):
                  include_miscellaneous_atoms=False,
                  protein_path_list=None, ligand_descriptions=None, keep_local_structures=False,
                  protein_file="protein_processed", ligand_file="ligand",
-                 knn_only_graph=False, matching_tries=1, dataset='PDBBind'):
+                 knn_only_graph=False, matching_tries=1, dataset='PDBBind', nci_cache_path=None):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -159,12 +159,15 @@ class PDBBind(Dataset):
         self.matching_tries = matching_tries
         self.ligand_file = ligand_file
         self.dataset = dataset
+        self.nci_cache_path = nci_cache_path
         assert knn_only_graph or (not all_atoms)
         self.all_atoms = all_atoms
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
             cache_path += '_allatoms'
+        if self.nci_cache_path is not None:
+            cache_path += '_nci'
         self.full_cache_path = os.path.join(cache_path, f'{dataset}3_limit{self.limit_complexes}'
                                                         f'_INDEX{os.path.splitext(os.path.basename(self.split_path))[0]}'
                                                         f'_maxLigSize{self.max_lig_size}_H{int(not self.remove_hs)}'
@@ -213,7 +216,80 @@ class PDBBind(Dataset):
             if hasattr(complex_graph['receptor'], a):
                 delattr(complex_graph['receptor'], a)
 
+        self._add_nci_edges(complex_graph)
         return complex_graph
+
+    def _add_nci_edges(self, complex_graph):
+        if self.nci_cache_path is None:
+            return
+        complex_name = complex_graph['name'] if 'name' in complex_graph else None
+        if complex_name is None:
+            return
+        nci_labels = self._load_nci_labels(str(complex_name))
+        if nci_labels is None:
+            return
+        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if edge_index is None:
+            return
+        edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
+            edge_index = edge_index.t()
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        nci_edge.edge_index = edge_index
+        if edge_type is not None:
+            nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
+        if edge_dist is not None:
+            nci_edge.edge_dist_y = torch.as_tensor(edge_dist, dtype=torch.float32)
+
+    def _load_nci_labels(self, complex_name):
+        if self.nci_cache_path is None:
+            return None
+        candidates = []
+        if complex_name:
+            candidates.extend([complex_name, complex_name[:4], complex_name[:6]])
+        for candidate in dict.fromkeys(candidates):
+            for ext in (".pt", ".npz"):
+                path = os.path.join(self.nci_cache_path, f"{candidate}{ext}")
+                if os.path.exists(path):
+                    if ext == ".pt":
+                        return torch.load(path, map_location="cpu")
+                    data = np.load(path, allow_pickle=True)
+                    return {key: data[key] for key in data.files}
+        return None
+
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        for complex_name in complex_names:
+            nci_labels = self._load_nci_labels(str(complex_name))
+            if self._print_nci_edge_stats(complex_name, nci_labels):
+                break
+
+    @staticmethod
+    def _print_nci_edge_stats(complex_name, nci_labels):
+        if nci_labels is None:
+            return False
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        if edge_type is None:
+            return False
+        edge_type = np.asarray(edge_type)
+        num_cand_edges = edge_type.shape[0]
+        if num_cand_edges == 0:
+            pos_ratio = 0.0
+            none_ratio = 0.0
+            num_pos_edges = 0
+        else:
+            num_pos_edges = int((edge_type > 0).sum())
+            num_none_edges = int((edge_type == 0).sum())
+            pos_ratio = num_pos_edges / num_cand_edges
+            none_ratio = num_none_edges / num_cand_edges
+        print(
+            f"[NCI stats] {complex_name}: num_pos_edges={num_pos_edges}, "
+            f"num_cand_edges={num_cand_edges}, pos_ratio={pos_ratio:.4f}, none_ratio={none_ratio:.4f}"
+        )
+        return True
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
@@ -222,6 +298,7 @@ class PDBBind(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
+        self._report_nci_stats_once(complex_names_all)
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
@@ -264,8 +341,8 @@ class PDBBind(Dataset):
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+            pickle.dump((rdkit_ligands), f)
 
     def inference_preprocessing(self):
         ligands_list = []
