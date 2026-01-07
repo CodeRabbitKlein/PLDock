@@ -228,14 +228,23 @@ class PDBBind(Dataset):
         nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
             return
-        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if "cand_edge_index" in nci_labels:
+            edge_index = nci_labels["cand_edge_index"]
+        else:
+            edge_index = nci_labels.get("edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
             edge_index = edge_index.t()
-        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
-        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        if "cand_edge_y_type" in nci_labels:
+            edge_type = nci_labels["cand_edge_y_type"]
+        else:
+            edge_type = nci_labels.get("edge_type_y")
+        if "edge_y_dist" in nci_labels:
+            edge_dist = nci_labels["edge_y_dist"]
+        else:
+            edge_dist = nci_labels.get("edge_dist_y")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         nci_edge.edge_index = edge_index
         if edge_type is not None:
@@ -266,6 +275,7 @@ class PDBBind(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
+        self._report_nci_stats_once(complex_names_all)
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
@@ -308,8 +318,8 @@ class PDBBind(Dataset):
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+            pickle.dump((rdkit_ligands), f)
 
     def inference_preprocessing(self):
         ligands_list = []

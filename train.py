@@ -40,6 +40,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     best_val_secondary_value = math.inf if args.inference_earlystop_goal == 'min' else 0
     best_epoch = 0
     best_val_inference_epoch = 0
+    baseline_nci_loss = None
+    baseline_pos_recall = None
 
     freeze_params = 0
     scheduler_mode = args.inference_earlystop_goal if args.val_inference_freq is not None else 'min'
