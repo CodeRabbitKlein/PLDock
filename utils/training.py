@@ -212,6 +212,7 @@ def _compute_nci_per_graph(logits_per_graph, labels_per_graph, device, apply_mea
     loss_out = torch.zeros(num_graphs, dtype=torch.float, device=device)
     pos_recall = torch.zeros(num_graphs, dtype=torch.float, device=device)
     none_acc = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    valid_mask = torch.zeros(num_graphs, dtype=torch.bool, device=device)
     for i, (logits, labels) in enumerate(zip(logits_per_graph, labels_per_graph)):
         if labels is None or logits is None or labels.numel() == 0:
             continue
@@ -219,10 +220,14 @@ def _compute_nci_per_graph(logits_per_graph, labels_per_graph, device, apply_mea
         loss_out[i] = loss_i
         pos_recall[i] = pos_recall_i
         none_acc[i] = none_acc_i
+        valid_mask[i] = True
     if apply_mean:
-        return loss_out.mean() * torch.ones(1, dtype=torch.float, device=device), \
-            pos_recall.mean() * torch.ones(1, dtype=torch.float, device=device), \
-            none_acc.mean() * torch.ones(1, dtype=torch.float, device=device)
+        if not valid_mask.any():
+            zeros = torch.zeros(1, dtype=torch.float, device=device)
+            return zeros, zeros, zeros
+        return loss_out[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device), \
+            pos_recall[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device), \
+            none_acc[valid_mask].mean() * torch.ones(1, dtype=torch.float, device=device)
     return loss_out, pos_recall, none_acc
 
 
