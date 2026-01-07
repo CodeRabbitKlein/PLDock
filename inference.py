@@ -40,7 +40,7 @@ from utils.logging_utils import configure_logger, get_logger
 import utils.utils
 from datasets.process_mols import write_mol_with_coords
 from utils.download import download_and_extract
-from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
+from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule, set_time
 from utils.inference_utils import InferenceDataset, set_nones
 from utils.sampling import randomize_position, sampling
 from utils.utils import get_model
@@ -57,6 +57,20 @@ prody_logger.setLevel(logging.ERROR)
 REPOSITORY_URL = os.environ.get("REPOSITORY_URL", "https://github.com/gcorso/DiffDock")
 REMOTE_URLS = [f"{REPOSITORY_URL}/releases/latest/download/diffdock_models.zip",
                f"{REPOSITORY_URL}/releases/download/v1.1/diffdock_models.zip"]
+
+
+def build_nci_edges(complex_graph, cutoff=10.0):
+    lig_pos = complex_graph['ligand'].pos
+    rec_pos = complex_graph['receptor'].pos
+    dist = torch.cdist(lig_pos, rec_pos)
+    mask = dist <= cutoff
+    if mask.any():
+        lig_idx, rec_idx = mask.nonzero(as_tuple=True)
+        edge_index = torch.stack([lig_idx, rec_idx], dim=0)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=lig_pos.device)
+    complex_graph['ligand', 'nci_cand', 'receptor'].edge_index = edge_index
+    return edge_index
 
 
 def get_parser():
@@ -344,6 +358,7 @@ def main(args):
             ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in data_list])
 
             # reorder predictions based on confidence output
+            nci_scores = None
             if confidence is not None and isinstance(confidence_args.rmsd_classification_cutoff, list):
                 confidence = confidence[:, 0]
             if confidence is not None:
@@ -351,6 +366,53 @@ def main(args):
                 re_order = np.argsort(confidence)[::-1]
                 confidence = confidence[re_order]
                 ligand_pos = ligand_pos[re_order]
+                data_list = [data_list[i] for i in re_order]
+                if confidence_data_list is not None:
+                    confidence_data_list = [confidence_data_list[i] for i in re_order]
+
+                if confidence_model is not None:
+                    nci_scores = []
+                    include_misc = bool(getattr(confidence_args, 'include_miscellaneous_atoms', False))
+                    base_graphs = confidence_data_list if confidence_data_list is not None else data_list
+                    with torch.no_grad():
+                        for pose_idx, base_graph in enumerate(base_graphs):
+                            pose_graph = copy.deepcopy(base_graph)
+                            pose_graph['ligand'].pos = data_list[pose_idx]['ligand'].pos
+                            pose_graph = pose_graph.to(device)
+                            set_time(pose_graph, 0, 0, 0, 0, 1, confidence_args.all_atoms, device, include_misc)
+                            edge_index = build_nci_edges(pose_graph, cutoff=10.0)
+                            if edge_index.size(1) == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            out = confidence_model(pose_graph, return_nci=True)
+                            nci_logits = None
+                            if isinstance(out, tuple):
+                                if len(out) >= 3:
+                                    nci_logits = out[2]
+                                elif len(out) == 2:
+                                    nci_logits = out[1]
+                            if nci_logits is None or nci_logits.numel() == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            probs = torch.softmax(nci_logits, dim=-1)
+                            conf_edge = probs[:, 1:].max(dim=-1).values
+                            if conf_edge.numel() == 0:
+                                nci_scores.append(torch.tensor(-20.0, device=device))
+                                continue
+                            top_k = min(50, conf_edge.numel())
+                            top_conf = torch.topk(conf_edge, top_k).values
+                            nci_scores.append(torch.log(top_conf + 1e-6).mean())
+
+                    nci_scores = torch.stack(nci_scores).cpu().numpy()
+                    score_final = confidence + 0.1 * nci_scores
+                    final_order = np.argsort(score_final)[::-1]
+                    confidence = confidence[final_order]
+                    ligand_pos = ligand_pos[final_order]
+                    nci_scores = nci_scores[final_order]
+                    data_list = [data_list[i] for i in final_order]
+                    if confidence_data_list is not None:
+                        confidence_data_list = [confidence_data_list[i] for i in final_order]
+                    re_order = re_order[final_order]
 
             # save predictions
             write_dir = f'{args.out_dir}/{complex_name_list[idx]}'
@@ -358,7 +420,14 @@ def main(args):
                 mol_pred = copy.deepcopy(lig)
                 if score_model_args.remove_hs: mol_pred = RemoveAllHs(mol_pred)
                 if rank == 0: write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}.sdf'))
-                write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}.sdf'))
+                if nci_scores is not None:
+                    write_mol_with_coords(
+                        mol_pred,
+                        pos,
+                        os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}_nci{nci_scores[rank]:.3f}.sdf')
+                    )
+                else:
+                    write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_confidence{confidence[rank]:.2f}.sdf'))
 
             # save visualisation frames
             if args.save_visualisation:
