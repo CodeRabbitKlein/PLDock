@@ -102,6 +102,12 @@ class AAModel(torch.nn.Module):
         self.lr_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
         self.ar_edge_embedding = nn.Sequential(nn.Linear(distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
         self.la_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
+        self.nci_head = nn.Sequential(
+            nn.Linear(2 * ns + cross_distance_embed_dim, ns),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ns, 8)
+        )
 
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, rec_max_radius, distance_embed_dim)
@@ -391,6 +397,32 @@ class AAModel(torch.nn.Module):
         cross_cutoff = (tr_sigma * 3 + 20).unsqueeze(1) if self.dynamic_max_cross else self.cross_max_distance
         lr_edge_index, lr_edge_attr, lr_edge_sh, lr_edge_weight, la_edge_index, la_edge_attr, \
             la_edge_sh, la_edge_weight = self.build_cross_lig_conv_graph(data, cross_cutoff)
+
+        nci_logits = None
+        if ('ligand', 'nci_cand', 'receptor') in data.edge_types:
+            cand_edge_index = data['ligand', 'nci_cand', 'receptor'].edge_index
+            num_rec = rec_node_attr.size(0)
+            lr_keys = lr_edge_index[0] * num_rec + lr_edge_index[1]
+            cand_keys = cand_edge_index[0] * num_rec + cand_edge_index[1]
+            lr_sorted, lr_order = torch.sort(lr_keys)
+            cand_pos = torch.searchsorted(lr_sorted, cand_keys)
+            valid = (cand_pos < lr_sorted.numel()) & (lr_sorted[cand_pos] == cand_keys)
+
+            rbf = torch.zeros((cand_edge_index.size(1), self.cross_distance_embed_dim), device=lig_node_attr.device)
+            if valid.any():
+                rbf[valid] = lr_edge_attr[lr_order[cand_pos[valid]], self.sigma_embed_dim:]
+            if (~valid).any():
+                cand_edge_vec = data['receptor'].pos[cand_edge_index[1]] - data['ligand'].pos[cand_edge_index[0]]
+                cand_edge_length = self.cross_distance_expansion(cand_edge_vec.norm(dim=-1))
+                rbf[~valid] = cand_edge_length[~valid]
+
+            nci_input = torch.cat([
+                lig_node_attr[cand_edge_index[0]],
+                rec_node_attr[cand_edge_index[1]],
+                rbf
+            ], dim=-1)
+            nci_logits = self.nci_head(nci_input)
+
         lr_edge_attr= self.lr_edge_embedding(lr_edge_attr)
         la_edge_attr = self.la_edge_embedding(la_edge_attr)
 
@@ -485,7 +517,8 @@ class AAModel(torch.nn.Module):
             tr_pred = tr_pred / tr_sigma.unsqueeze(1)
             rot_pred = rot_pred * so3.score_norm(rot_sigma.cpu()).unsqueeze(1).to(data['ligand'].x.device)
 
-        if self.no_torsion or data['ligand'].edge_mask.sum() == 0: return tr_pred, rot_pred, torch.empty(0,device=self.device), None
+        if self.no_torsion or data['ligand'].edge_mask.sum() == 0:
+            return tr_pred, rot_pred, torch.empty(0,device=self.device), None, nci_logits
 
         # torsional components
         tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh, tor_edge_weight = self.build_bond_conv_graph(data)
@@ -505,7 +538,7 @@ class AAModel(torch.nn.Module):
         if self.scale_by_sigma:
             tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
                                              .to(data['ligand'].x.device))
-        return tr_pred, rot_pred, tor_pred, None
+        return tr_pred, rot_pred, tor_pred, None, nci_logits
 
     def get_edge_weight(self, edge_vec, max_norm):
         if self.smooth_edges:
