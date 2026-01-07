@@ -128,6 +128,9 @@ def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma,
         device=device,
         apply_mean=apply_mean
     )
+    nci_loss = nci_loss.cpu()
+    pos_recall = pos_recall.cpu()
+    none_acc = none_acc.cpu()
 
     loss_diff = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight + \
         sidechain_loss * sidechain_weight + backbone_loss * backbone_weight
