@@ -1,0 +1,286 @@
+下面我按“问题诊断 → 优化原则 → 可落地全流程方案（数据预处理→特征工程→训练→推理）→MVP落地清单”的方式，把你在 `QA.txt` 里的想法补齐成一个工程上能实施的 DiffDock 改造方案，并明确哪些点目前不够、怎么补。
+
+---
+
+## 1) 你这份计划的核心价值与当前主要不足
+
+### 已有价值（你抓对了关键）
+
+* 目标定义清楚：不仅要高精度柔性对接，还要**学习/预测关键残基–配体原子的非共价相互作用（7类）**。
+* 数据来源与标注思路正确：PDBBind2020 + PLIP `report.json`，并且意识到 NCI 的**稀疏性/异构性**，需要统一编码器。
+* 你提出“把 NCI 做成边特征/边监督 + 辅助头 + 推理可做能量引导”，方向非常对。 
+
+### 关键不足（导致“写得对但落不下去”的点）
+
+1. **监督张量的定义不闭合**
+   你提出要输出 (\hat{M}\in\mathbb{R}^{N_{lig}\times N_{prot}\times 7}) 并做交叉熵，但没有定义：
+
+* 训练时到底对哪些 ((i,j)) 计算（全连接会爆内存；只用正边会学不会“无相互作用”）。
+* “无相互作用”是否作为第 8 类（None）。如果不引入 None/负样本，分类头会退化。
+
+2. **蛋白图是残基级，但 PLIP 记录往往是原子级几何**
+   你在代码里用 CA 建残基坐标映射，但氢键/盐桥/金属配位等的方向性与距离目标通常是“侧链原子—配体原子”。只用 CA 会让角度/距离监督变噪声，尤其是你想强调 SIDECHAIN。
+
+3. **多原子相互作用（芳环、π）处理不够严谨**
+   你自己也提到 pistacking/pication 可能涉及环原子列表，需要分配给每个原子；但当前代码是“环中心坐标匹配最近原子”，会引入系统性错标。
+
+4. **能量引导在推理阶段缺少“闭环来源”**
+   你提出推理阶段用 (U_{inter}) 做 guidance，但推理时没有 PLIP 标签。要闭环，就必须：
+
+* 要么先做一个“交互预测器/锚点预测器”在推理时产生约束；
+* 要么让扩散网络在每步产生高置信的交互边并用于 guidance（等价于内置预测器）。
+
+5. **工程细节缺失：失败样本、阈值策略、类别不平衡、评价指标**
+   你提到了稀疏性和类别嵌入、距离衰减，但没有落到“如何采样负边、如何做 class-balanced/focal、如何评估 NCI 预测质量与 docking 质量的 trade-off”。
+
+---
+
+## 2) 优化后的总体方案（你要的“可落地实施版”）
+
+### 总体设计：一个“扩散对接 + NCI 预测 +（可选）能量引导”的统一框架
+
+* **主任务（DiffDock）**：预测平移/旋转/扭转（以及你已有的 sidechain/柔性相关分支）。
+* **辅助任务（NCI head）**：对候选 ((\text{lig atom }i,\ \text{prot residue }j)) 输出 8 类：`None + 7类NCI`，并对正例回归几何参数（距离/角度/offset 等）。
+* **推理闭环（关键）**：推理过程中不需要 PLIP；由 NCI head 输出 top-K 高置信交互边，构造 (U_{inter}) 做 guidance（或仅作为重打分）。你在文档里已经给出了 guidance 的数学形式与 anti-clash 思路，现在补上“约束来自模型预测”。
+
+---
+
+## 3) 分阶段可实施流程（数据→特征→训练→推理）
+
+### A. 数据预处理（一次性离线产物，保证训练/推理都跑得动）
+
+#### A1. 数据组织与标准化
+
+* 输入：PDBBind2020（复合物结构）
+* PLIP 输出：每个复合物一个 `report.json` 文件夹
+* 建议生成一个统一中间格式（推荐 `npz`/`pt`）：
+
+  * `ligand`: RDKit 原子坐标、原子特征、键拓扑、可旋转键标记
+  * `protein`: 残基索引、残基类型、残基“代表点”坐标（见 A3）
+  * `labels_nci`: 稀疏正边列表 + 每条边的类型与几何标签
+  * `meta`: pdb_id、失败原因、映射误差统计等
+
+#### A2. PLIP →（配体原子索引）对齐（你已有方向，但要更鲁棒）
+
+你写的“靠 LIGCOO + KDTree 找最近 RDKit 原子”是对的，但工程上要补：
+
+* **阈值自适应**：不要固定 0.1Å/0.5Å。建议：
+
+  * 先用 0.2Å；若失败，尝试 0.4Å；再失败就丢样本并记录（避免错标污染训练）。
+* **多原子 π 作用**：
+
+  * 如果 record 有 `LIG_IDX_LIST`（你也提到过）：按列表直接映射；
+  * 若没有列表但提供 ring center：用 RDKit 找芳香环，匹配最近的环中心，再把该相互作用分配给环上全部原子（或建一个“ring pseudo-node”，见特征工程方案 B3）。
+
+#### A3. PLIP →（蛋白残基/原子）对齐：残基级图也要有“功能原子代表点”
+
+你当前用 CA 坐标建 residue map，对 docking 主任务可用，但对 NCI 几何监督偏粗。可落地的折中做法：
+
+* **保留残基级图（与你现有 receptor 图兼容）**
+* 但为每个残基预计算 2–4 个“功能点”（functional anchors），用于 NCI 的距离/方向监督与 guidance：
+
+  * H-bond donor anchor（如 N-H 上的重原子坐标）
+  * H-bond acceptor anchor
+  * 正/负电荷中心（盐桥）
+  * 芳香环中心（Phe/Tyr/Trp/His）
+  * 金属位点（如果残基附近有金属）
+
+这些 anchor 可以从 PDB 原子名规则或简单 SMARTS/模板得到。这样你仍是残基节点，但 NCI 几何用“残基功能点”而不是 CA。
+
+> 这样做能直接解决你强调的 SIDECHAIN 重要性：SIDECHAIN=True 的监督就落在侧链功能点上，而不是 CA。
+
+#### A4. 训练用“候选边集合”生成（解决你监督张量不闭合的问题）
+
+定义每个复合物的候选边集合 (E_{cand})，否则 (\hat{M}) 无法计算：
+
+* 用空间邻域筛选：对每个 ligand atom i，取 6–10Å 内的蛋白残基 j（或 top-K 最近残基），得到候选边。
+* 对候选边赋标签：
+
+  * 若在 PLIP 正例集合中：label = 具体 NCI 类型（7类之一）
+  * 否则：label = None（第 8 类）
+* 负样本太多怎么办：对 None 做**负采样**（例如每个正边采 10–30 条负边；或对每个 ligand atom 保留固定数量候选残基）。
+
+---
+
+### B. 特征工程（把 PLIP 异构记录变成统一可学表示）
+
+#### B1. 统一的“边标签/边特征”目标（你已有雏形，但需要标准化）
+
+你提出把 NCI 做成边特征向量 (e_{ij})（one-hot + 距离/方向/属性槽），我建议把它拆成**训练目标**两部分：
+
+1. **分类目标（必须有 None）**
+
+* (y^{type}_{ij} \in {0..7})（0=None，其余 7 类对应 halogen/hbond/hydrophobic/metal/pication/pistacking/saltbridge）
+
+2. **几何回归目标（只对正例）**
+   按你总结的最小字段集：
+
+* 通用：(d_{ij})（距离）
+* Hbond：don angle（建议回归 (\sin,\cos)）
+* Pistacking：centdist/angle/offset + type(P/T)
+* Halogen：dist + 两角
+* Metal：dist + metal type（分类或 embedding）
+
+#### B2. 输入边特征（给 NCI head/交叉注意力用）
+
+对每条候选边（i,j）构造输入：
+
+* (r_{ij} = x_i - x^{anchor}_j)（等变可用）
+* (|r_{ij}|)、单位向量、径向基展开（RBF）
+* 残基类型 embedding、配体原子类型 embedding
+* `is_key_sidechain`（来自 SIDECHAIN 标注）（注意：训练时可用作权重/监督；推理时模型输出概率，不应依赖真实 SIDECHAIN）
+
+#### B3. π 相互作用的两种可落地表示（你必须二选一，别混）
+
+* **方案 1（最省事）**：把 π 作用分配给环上全部原子（正边多对多）。优点是容易实现；缺点是标签更稀释。
+* **方案 2（更干净）**：为配体每个芳香环增加“ring pseudo-node”（位置=环中心、特征=环类型/电性），让 pistacking/pication 只连 pseudo-node。优点是监督更准确、图更稀疏；缺点是改图结构。
+
+我建议：MVP 用方案 1；稳定后切方案 2。
+
+---
+
+### C. 模型与训练（DiffDock 主干不动，新增 NCI head + 训练策略）
+
+#### C1. 模型结构改造（最小侵入式）
+
+在 DiffDock 的跨图交互模块（或你 EGNN 的 cross edges）上加一个并行 head：
+
+* 输入：每条候选边的融合表示 (h_{ij})（由 ligand node embedding + protein node embedding + 边几何编码得到）
+* 输出：
+
+  * `logits_type_ij`：8 类（None + 7 NCI）
+  * `geom_ij`：若预测为某些类型则回归（dist/angle/offset 等）
+
+这与你文档里“并行预测头 + L = L_diff + λ L_NCI”的想法一致，但现在监督集合与 None 类都闭合了。
+
+#### C2. 损失函数（把你文档的建议落到可实现公式）
+
+你已经提出了一系列关键点：交互分支损失、重要残基加权、方向性余弦损失、时间退火、anti-clash 正则。我给出一个“工程可直接写”的组合：
+
+1. 主任务：DiffDock 原始扩散/score loss：(L_{diff})
+
+2. NCI 分类：
+
+* (L_{type} = \text{FocalCE}(y^{type}, \hat{p}^{type})) 或 class-balanced CE
+* **强制加入 None 类**（否则推理无法筛选 top-K 约束）
+
+3. NCI 几何回归（仅正例）：
+
+* (L_{geom} = \sum_{(i,j)\in E_{pos}} \big(|\hat d-d| + \alpha\cdot(1-\cos(\Delta \theta)) + ...\big))
+  角度用 (\sin,\cos) 或余弦相似度（你文档也建议）
+
+4. SIDECHAIN/关键残基加权：
+
+* 对参与 NCI 的残基（或 SIDECHAIN=True 记录）提高 torsion/sidechain 分支权重（你写的逻辑方向正确）。
+
+5. 时间步退火（Time-dependent weighting）：
+
+* (\lambda_{NCI}(t)) 随噪声减小而增大（你已提出）
+  工程实现：例如 (\lambda_{NCI}(t)=\lambda_{max}\cdot(1-\bar t)^\gamma)，(\bar t\in[0,1])。
+
+综合：
+[
+L = L_{diff} + \lambda_{type}(t)L_{type} + \lambda_{geom}(t)L_{geom} + \lambda_{sc}L_{sidechain}
+]
+
+#### C3. 训练策略（建议两阶段，显著降低不稳定）
+
+* **阶段 1：NCI head 预训练（teacher forcing）**
+
+  * 输入晶体 pose（或轻噪声 pose），训练 `type+geom`，让 head 先学会“什么相互作用长什么样”。
+* **阶段 2：联合训练扩散**
+
+  * 全流程加噪，带 time-dependent λ，把 NCI 学到“去噪末期的几何精修规则”。
+
+这比一上来全联合更稳，尤其是在类别极不平衡时。
+
+---
+
+### D. 推理（Inference）闭环：不需要 PLIP，也能用你写的 (U_{inter})
+
+#### D1. 推理时输出“可用锚点”
+
+在每个去噪步（或最后若干步）：
+
+1. 计算候选边集合（同训练的邻域筛选）
+2. 用 NCI head 预测 (p(type_{ij}))，取 top-K（例如 K=20–50）高置信正边
+3. 为每条边分配：
+
+   * 类型（决定 (d_{target})、是否需要角度项）
+   * 置信度作为权重 (w_{ij})
+
+#### D2. 用能量引导修正去噪（把你文档的伪算法变成闭环版本）
+
+你已经定义了：
+(\tilde{s}=s_\theta(x_t,t)-\lambda\nabla_{x_t}U(x_t))
+现在令 (U = U_{inter} + U_{clash})：
+
+* (U_{inter}=\sum_{(i,j)\in \text{TopK}} w_{ij}\cdot(d_{ij}-d_{target(type)})^2)（你文档已有）
+* (U_{clash})：hinge 型排斥（你文档已有 anti-clash 思路）
+
+调度策略（工程上必须做，否则会“拉崩”采样）：
+
+* 前 70% step：(\lambda_{inter}) 很小（只做轻微偏置）
+* 后 30% step：(\lambda_{inter}) 增大，配合 (\lambda_{clash}) 做局部精修（与你写的“后期加大权重”一致）
+
+#### D3. 只做重打分的简化版（MVP 可选）
+
+如果你担心 guidance 引入不稳定：
+
+* 不在采样中施加梯度，只在生成 N 个 pose 后，用预测的 NCI 一致性分数 + clash 分数进行 rerank。
+  这能先验证“学到的 NCI 是否真能改善 docking 结果”。
+
+---
+
+## 4) 对你文档中那段 PyG HeteroData 代码的具体改造建议
+
+你给的类实现解决了“从 PLIP JSON 到 PyG HeteroData 的转换”，但要落地训练 NCI head，需要至少做以下改造：
+
+1. **edge_index 不应只存正边**
+   否则模型永远看不到 None。应当：
+
+* 先生成候选边（距离 cutoff / kNN）
+* 再对候选边打标签（0=None，1..7=NCI）
+
+2. **蛋白节点特征不能全 0**
+   你现在 `protein.x = zeros`，至少加：
+
+* residue type embedding（20 AA + UNK）
+* 是否在 pocket（距离配体 < 8Å）
+* 可选：功能点类型统计（donor/acceptor/aromatic/charged）
+
+3. **角度不要直接塞一个弧度标量**
+   你现在 `attr[8] = deg2rad(angle)`（片段里能看出你在塞角度），建议改为 (\sin,\cos)（你在文档里也写了）
+
+4. **π 相互作用的匹配策略要升级**
+   至少支持 `LIG_IDX_LIST`，否则 pistacking/pication 标签噪声会非常大。
+
+---
+
+## 5) MVP（最小可行实现）清单：两周内能跑起来的版本
+
+### MVP-1：先把监督闭合（最重要）
+
+* [ ] 解析 PLIP `report.json` → 稀疏正边列表（含 type + dist，先不做角度/offset）
+* [ ] 生成候选边集合（8Å cutoff + 负采样）
+* [ ] 标签：8 类（None + 7）
+
+### MVP-2：模型改造最小化
+
+* [ ] 在 DiffDock cross-edge 表示上加 `NCI classification head`
+* [ ] 训练：(L = L_{diff} + \lambda L_{type})（先不做 geom 回归、不做 guidance）
+
+### MVP-3：验证闭环是否成立
+
+* [ ] 推理生成多构象 → 用 NCI head 预测的“交互一致性分数”做 rerank
+* [ ] 指标：Docking success@2Å / RMSD + NCI edge F1（只在测试集用 PLIP 评估）
+
+等 MVP 跑通且看到“rerank 有收益”后，再上：
+
+* 角度/offset 回归
+* time-dependent λ
+* 采样期 guidance（(U_{inter}+U_{clash})）
+
+---
+
+如果你愿意，我下一步可以直接把“候选边构建 + 8类标签 + 负采样 + PyG 数据对象字段规范（data.y_type / data.edge_index_cand 等）”写成一份更贴近你当前 DiffDock 代码结构的伪代码/接口定义，确保你能从现有 dataloader 直接接入训练循环。

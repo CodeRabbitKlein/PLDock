@@ -1,0 +1,242 @@
+1.核心目标：在基于扩散模型和图等变神经网络的蛋白质配体复合物构象预测任务中，既能做到高精度柔性对接又能学习并预测出蛋白质关键残基和配体发生的非共价相互作用。
+
+2.数据集：PDBBind 2020的数据。在当前项目data/pdbbind下。
+
+3.PLIP非共价相互作用(NCI)分析：
+	对数据集中的复合物识别 出7 种主要相互作用：氢键、疏水相互作用  、pi-Stacking、pi-Cation、盐桥 (Salt Bridges)、卤键、金属配位。数据在当前项目data/plip下，每个复合物一个文件夹，其中包含report.json文件。
+
+
+4.PLIP report.json文件处理：
+	PLIP提取后的数据。这些数据中的复合物发生的非共价相互作用在数量和类型上都存在显著的差异，在蛋白质-配体复合物的研究中，非共价相互作用（NCI）确实表现出极强的稀疏性和异构性。（以 PDB 1a0q 为例），我们可以看到：该复合物有 10 个疏水作用、4 个氢键和 1 个 pi-堆积，而盐桥等其他作用为 0。
+
+关于report.json中，对于每个记录中的字段，选择最关键的字段作为特征：
+非共价相互作用核心特征选择表，在 GNN 中，我们通常将这些特征分为几何特征（用于坐标更新）和属性特征（用于交互评分）。
+
+
+由于不同复合物的记录差异很大，需要设计一个统一的特征编码器（Unified Feature Encoder）。以下是针对 PLIP 全量输出的处理建议：
+A .坐标对齐字段 (Coordinate Fields)
+所有的记录中都包含 LIGCOO 和 PROTCOO。
+用途： 这是将 PLIP 标签映射回 RDKit 分子图的唯一“锚点”。
+处理方法： 建议将这些坐标转化为相对位移向量 $\vec{r}_{ij} = \vec{x}_{lig} - \vec{x}_{prot}$等变神经网络（如 EGNN）可以直接处理该向量，以保持 $E(3)$ 不变性。
+
+B. 方向性特征 (Directionality)角度 (Angles)： 在 hbond、pistacking 和 halogen 中均有出现。特征化： 将角度转化为正弦和余弦值 $\sin(\theta), \cos(\theta)$，避免周期性边界问题。
+C. 柔性指标 (Flexibility Indicator)侧链标志 (SIDECHAIN)： 在 hbond 和 halogen 中存在。重要性： 如果 SIDECHAIN 为 True，说明该相互作用涉及蛋白质的动态侧链。
+
+解决数据不平衡与稀疏性的策略您的 report.json 显示 saltbridge 和 pication 为空，这在单个样本中很常见。为了让模型学习到所有 7 种作用，建议：类别嵌入 (Embedding Layer)： 设计一个 7 维的 Embedding 空间。即使某个样本缺失某种作用，该维度的权重也会在全局训练中通过其他样本得到优化。距离衰减项： 对于 PLIP 未识别出 NCI 的原子对，不要简单地设为 0。可以使用基于物理的势能函数（如 $1/r^6$）计算一个基础的吸引/排斥值，作为背景噪声，让模型学习从“无相互作用”到“强非共价相互作用”的连续演变。
+
+
+
+5.特征工程：将 NCI 转化为可学习向量，处理数据差异与稀疏性
+
+推荐方案：构建“相互作用边特征” (Interaction Edge Features)在图神经网络中，我们不为整个分子定义特征，而是为 (配体原子 $i$, 蛋白原子/残基 $j$) 这对节点定义的边特征 $e_{ij}$。$e_{ij}$ 的向量组成建议：类别标识 (7-dim One-hot): 标识当前边属于哪种 NCI。如果 $i, j$ 之间没有任何 PLIP 识别的作用，该项全为 0。通用几何标量 (3-dim):距离 $d_{ij} = ||\vec{x}_i - \vec{x}_j||$。$\vec{x}_i - \vec{x}_j$ 的单位方向向量（用于等变性计算）。专用属性槽 (Fixed-size Padding): 预留 3-5 个位置放入角度、偏移量等特有数值。若该类型不具备此属性，则填充为 0。化学环境嵌入: 包含 DONORTYPE 或 RESTYPE 的 Embedding 向量。
+
+解决 PLIP 与 RDKit 索引不一致的工程实现：这是数据预处理中最耗时的一步。由于 PLIP 使用 PDB 原子序号，而 RDKit 重排了索引，唯一可靠的桥梁是三维坐标。操作流程：加载 RDKit 分子： 从 PDB 或 SDF 加载配体，获取其原子坐标 $C_{RD}$ 和 索引 $I_{RD}$。解析 PLIP JSON： 提取 LIGCOO（如 [12.107, 17.104, 57.026]）和对应的相互作用类型。空间最近邻查询：使用 scipy.spatial.KDTree 对 $C_{RD}$ 建模。将 LIGCOO 作为查询点，寻找距离最近（通常 $< 0.1$ Å）的 RDKit 原子。注意： 对于 $\pi$-堆积这种涉及多个原子的作用（LIG_IDX_LIST），需将相互作用分配给环上的每一个原子。
+
+扩散模型如何利用这些特征进行“预测”？为了让模型不仅能利用这些信息，还能在预测新药时“推理”出这些信息，你可以采用 多任务扩散 (Multi-task Diffusion)：训练阶段： 扩散模型的 Score Network 在预测 $\epsilon$ 的同时，额外增加一个预测头 $f(h_i, h_j)$，目标是重建上述 $e_{ij}$ 中的类别标签和几何参数。推理阶段： 模型在从噪声恢复构象的过程中，由于内部参数被强迫理解了“这里必须形成一个 2.8 Å 的氢键才能降低能量”，它生成的构象会天然符合非共价相互作用的物理约束。
+
+针对 7 种作用的特征提取细节
+研究 PLIP 的输出规范后，我们为每种作用提取以下“最简且关键”的字段：
+Hydrophobic: 只需 DIST。它是最松散的约束，主要贡献是非特异性的范德华力。
+H-bond: 提取 DIST_D-A 和 DON_ANGLE。关键点： 记录 PROTISDON。如果蛋白是供体，说明配体该位置必须是受体。
+Pi-Stacking: 提取 CENTDIST（中心距）、ANGLE（环夹角）和 OFFSET。重要： 区分 TYPE ('P' 平行或 'T' 垂直)，这对环的堆叠构象预测至关重要。
+Salt Bridge: 提取 DIST。逻辑： 它是强库仑力，通常在扩散模型去噪的早期阶段就应确定位置。
+Pi-Cation: 提取 DIST 和 OFFSET。
+Halogen: 提取 DIST 和双角度 DON_ANGLE, ACC_ANGLE。
+Metal: 提取 DIST 和 METAL_TYPE（如 Zn, Mg）。
+
+
+6.在扩散模型中实现“预测”
+在基于扩散模型的柔性对接（如 DiffDock 架构）中，我们不仅要生成坐标，还要让模型隐式地建模这些非共价相互作用。方案：辅助监督学习 (Auxiliary Supervision)在训练扩散模型的 Score Network 时，增加一个并行的预测头：输入： 当前扩散步骤的配体构象 $X_t$ 和蛋白特征 $P$。预测： 模型输出一个交互矩阵 $\hat{M} \in \mathbb{R}^{N_{lig} \times N_{prot} \times 7}$。损失函数：$$L = L_{diffusion} + \lambda L_{NCI}$$其中 $L_{NCI}$ 是预测矩阵 $\hat{M}$ 与从 report.json 转化来的真实交互张量之间的交叉熵损失。这样做的意义：在推理（Inference）阶段，即使没有 PLIP 信息，模型也会因为在训练中学习了“为了降低 $L_{NCI}$，氧原子必须靠近氨基酸供体”这一规律，从而生成具有高保真氢键的柔性构象。
+
+
+蛋白质侧链柔性的处理：
+既然要做高精度柔性对接，PLIP 中的 SIDECHAIN 字段（在 hbond 记录中）就极其重要。如果一个残基参与了关键的非共价相互作用（NCI），它在势能面上通常处于一个较深的局部极小值。在扩散模型（Diffusion Model）中，我们不仅要让模型学会如何“去噪”，更要让它学会如何“定位”这些关键的物理约束。
+
+交互感知引导（Interaction-Aware Guidance）：
+建议在反向（去噪）过程对这些 SIDECHAIN: true 的残基做特殊处理：
+A. 交互掩码学习 (Interaction Masking / BERT-style)你可以借鉴 BERT 的思想，但不是加噪，而是 Masking 特征。做法： 在训练时，随机掩盖（Mask）某些关键残基的类型信息或其在 PLIP 中的 NCI 标签，要求模型仅根据配体的空间位置预测该残基的侧链二面角 $\chi$ 以及它所参与的 NCI 类型。目的： 强迫模型学习“配体在这个位置，必然要求蛋白侧链以这种构象提供一个氢键受体”的隐性物理规律。
+
+B. 侧链评分加权 (Torsional Score Weighting)在计算评分函数 $\nabla_{\theta} \log p(\theta)$ 时，给那些参与 NCI 的侧链二面角更高的 Loss 权重。逻辑： 如果模型预测错了一个不参与交互的表面残基构象，代价较小；但如果预测错了一个 PLIP 标记为关键交互的侧链构象，给予高倍惩罚。这能引导模型在推理时优先锁定关键接触点。
+
+C. 显式几何引导 (Geometric Guidance)在推理阶段（Sampling），引入 PLIP 信息作为一种先验偏置（Prior Bias）：如果已知某个残基应该与配体形成氢键，可以在去噪步中加入一个极小的吸引力项（Interaction Potential），将该侧链原子“轻轻推向”理想的氢键几何范围。
+
+在扩散模型的采样（Sampling）过程中引入能量引导（Energy-guided Guidance）。在标准的扩散模型中，我们沿着评分函数（Score Function） $\nabla_x \log p_t(x)$ 进行去噪。要加入额外的约束，我们定义一个能量函数 $U(x)$，将去噪步的评分项修正为：$$\tilde{s} = s_{\theta}(x_t, t) - \lambda \nabla_{x_t} U(x_t)$$其中 $\lambda$ 是引导强度。以下是这两个功能的具体实现逻辑：
+
+显式几何引导 (Geometric Guidance) 的实现其目标是利用 PLIP 提供的先验（如：配体原子 $i$ 与蛋白原子 $j$ 之间应存在 2.8Å 的氢键），在采样时给模型一个“拉力”。实现步骤：定义目标势能 $U_{attract}$：可以使用谐振子势（Harmonic Potential）。对于 PLIP 识别出的每一对关键相互作用 $(i, j)$，定义能量：$$U_{inter}(x) = \sum_{(i,j) \in NCI} w_{ij} \cdot (d_{ij} - d_{target})^2$$$d_{ij} = \|x_i - x_j\|_2$ 是当前采样步中原子间的实际距离。$d_{target}$ 是该类相互作用的理想距离（如氢键通常设为 2.8Å-3.0Å）。$w_{ij}$ 是权重，可以根据 PLIP 的相互作用类型（如盐桥权重大于疏水作用）进行调整。
+
+计算梯度：在每个去噪步 $t$，由于你的模型预测的是评分（Score），你需要计算能量对坐标 $x_t$ 的负梯度：$$g_{attract} = - \nabla_{x_t} U_{inter}(x_t)$$这个梯度向量会指向“缩短距离偏差”的方向。
+
+注入采样过程：如果你在扭转角空间（Torsion Space）采样，需要通过**链式法则（Autograd）**将坐标空间的梯度 $g_{attract}$ 传导回扭转角 $\tau$：$$\Delta \tau = \frac{\partial U_{inter}}{\partial x} \cdot \frac{\partial x}{\partial \tau}$$在更新 $\tau_{t-1}$ 时，将这个额外的增量加上去。
+
+
+
+
+
+7.如何将 SIDECHAIN: true 融入模型
+将 PLIP 的 SIDECHAIN 字段作为一个**布尔特征（Boolean Feature）**直接输入到等变图神经网络（EGNN）中：
+
+节点标注： 为蛋白质图中的每个节点增加一个维度：is_key_sidechain (0 或 1)。
+注意力门控： 在 Cross-Attention 层中，允许配体原子对 is_key_sidechain=1 的残基产生更高的关注度。
+
+多尺度去噪：
+对于 is_key_sidechain=0 的残基，使用常规的骨架/侧链混合扩散。
+对于 is_key_sidechain=1 的残基，模型需要额外输出一个 交互存在性预测值，将其作为辅助任务（Auxiliary Task）进行联合训练。
+
+
+8.损失函数优化建议：
+
+引入显式的交互分支损失 (Interaction-Aware Loss)分析： 目前的损失函数纯粹基于几何坐标和角度（MSE）。模型只知道原子“应该在哪”，但不知道“为什么要在那”（即缺乏物理相互作用的驱动力）。建议： * 增加 NCI 分类损失： 建议引入一个辅助任务预测头，利用你之前处理的 PLIP 数据，计算预测的交互类型（氢键、疏水作用等）与真实类型之间的交叉熵损失。距离约束惩罚： 对于 PLIP 识别出的关键原子对，除了监督 $\chi$ 角，还可以增加一个专门的“键深”损失，强制要求这些原子对的距离落在物理允许的范德华半径或氢键范围内。
+
+ 实施基于残基重要性的加权策略 (Importance Weighting)分析： 现在的 sidechain_loss 对蛋白质所有残基一视同仁。但在对接任务中，结合口袋内参与 NCI 的残基（即 SIDECHAIN: true 的残基）对构象稳定性的贡献远大于表面溶剂暴露处的残基。建议：动态权重分配： 不要使用统一的 sidechain_weight。建议根据 PLIP 的反馈，为参与非共价相互作用的残基分配更高的 Loss 权重（例如权重设为 5.0），而对无关残基使用较低权重（如 1.0）。这将引导模型将“注意力”集中在影响结合亲和力的关键侧链上。
+
+ 处理角度预测的“方向性”增强分析： 在 sidechain_weight > 0 的逻辑中，你使用了 torch.min(difference, 1 - difference) 来处理二面角的周期性。这对于几何重建是够的，但对于 NCI（如 $\pi$-$\pi$ 堆积或氢键方向）来说，角度的微小偏差可能导致物理意义完全丧失。建议：向量余弦相似度损失： 对于 PLIP 报告中具有方向性的作用（如氢键的供体-受体向量），建议增加一个向量夹角的余弦相似度损失。相比于单纯的 $\chi$ 角差值，向量监督能更直观地优化原子间的空间指向性。
+
+损失函数的时间演化（Time-dependent Loss weighting）分析： 在扩散模型中，高噪声水平（$t$ 较大）时，模型学习的是全局分布；低噪声水平（$t$ 较小）时，模型学习的是精细结构。建议：NCI 损失的退火机制： 非共价相互作用是精细的局部约束。建议让 NCI 相关的损失权重随时间 $t$ 的减小而增大。在去噪的最后阶段（靠近晶体结构时），让相互作用损失占据主导，从而强制模型矫正那些细微但关键的非共价接触。
+
+蛋白质侧链的“掩码”自监督学习 (Masking Strategy)分析： 为了让模型“学会预测”而不仅仅是“匹配”坐标。建议：在计算 sidechain_loss 时，可以尝试随机掩盖掉一部分 PLIP 识别出的交互标签，并在 Loss 中加入一项，要求模型根据剩余的构象信息重新恢复这些交互特征。这能显著提升模型对未见复合物中非共价相互作用的泛化预测能力。
+
+物理不合理性的惩罚 (Anti-clash Penalty)分析： 纯 MSE 损失有时会导致原子重叠（Clash）。建议：增加一个简单的范德华斥力项作为正则化。当预测的配体原子与蛋白原子距离小于安全阈值时，产生一个极大的正向惩罚。这能辅助柔性对接在保持精度的同时，符合基本的物理排斥定律。实现步骤：定义斥力势能 $U_{clash}$：不需要复杂的 Lennard-Jones 全量计算，通常使用**铰链损失（Hinge Loss）**风格的斥力项即可，因为它只在原子距离过近时起作用：$$U_{clash}(x) = \sum_{i \in Lig} \sum_{j \in Prot} \max(0, \sigma_{ij} - d_{ij})^2$$$\sigma_{ij}$ 是安全阈值，通常取两个原子范德华半径之和（$R_i + R_j$），或者统一取一个经验值（如 2.5Å）。当 $d_{ij} > \sigma_{ij}$ 时，能量为 0，不干扰正常采样。当 $d_{ij} < \sigma_{ij}$ 时，能量随距离缩短剧增。空间加速优化：如果每个采样步都计算所有原子对（$N_{lig} \times N_{prot}$）的距离，速度会极慢。实现技巧： 仅针对配体原子周围 4Å 范围内的蛋白原子计算斥力。可以使用 scipy.spatial.KDTree 或 torch.searchsorted 在每一步动态筛选近邻。梯度修正：同样计算 $g_{clash} = - \nabla_{x_t} U_{clash}(x_t)$。这个力会产生一个“排斥效应”，将相互挤压的原子推开。
+
+
+综合引导的伪算法流程在推理循环（Inference Loop）中，每一步的逻辑如下：模型预测： Score Network 输出原始预测 $\hat{\epsilon}$（对应你的 tr_pred, rot_pred, tor_pred, sidechain_pred）。能量计算：根据当前坐标 $x_t$ 计算 $U_{total} = \lambda_1 U_{inter} + \lambda_2 U_{clash}$。自动求导：利用 PyTorch 的 loss.backward() 对当前的预测变量（如 tor_pred 和 sidechain_pred）求导。修正更新：new_score = original_score - grad_from_energy。使用 new_score 进行常规的 Langevin 动力学步进或 ODE 求解。关键注意事项：引导强度 $\lambda$ 的调度： 在采样初期（$t$ 较大，噪声大），$U_{clash}$ 的权重应较小，允许原子大幅度穿过以寻找全局最优位置；在采样后期（$t$ 较小），应加大 $U_{clash}$ 和 $U_{inter}$ 的权重，进行精细的局部修整。计算开销： 显式几何引导只涉及 PLIP 识别的少数原子对，计算量极小；但 Anti-clash 涉及较多原子，建议只针对“配体原子 vs 蛋白原子”计算，跳过蛋白内部原子的斥力计算（假设蛋白内部结构由侧链扩散模型约束）。
+
+
+
+9.为了实现从 PLIP JSON 到 PyTorch Geometric (PyG) HeteroData 的转换，我们需要解决两个核心挑战：空间坐标对齐索引和异质图边的构建。
+
+下面是一个完整的 Python 类实现。它包含了坐标匹配逻辑、7 种非共价相互作用的解析、以及 HeteroData 的组装。
+我们需要将 PLIP 的分析结果（坐标空间）与 PDBBind 的原始结构（拓扑空间）进行精确缝合。
+在这个实现中，我们需要重点解决蛋白质残基索引的匹配，因为 PLIP 报告的是 RESNR（PDB 中的残基编号），而图神经网络通常需要从 0 开始的连续索引。
+import os
+import json
+import torch
+import numpy as np
+from rdkit import Chem
+from scipy.spatial import KDTree
+from torch_geometric.data import HeteroData
+
+class PDBBindHeteroDataset:
+    def __init__(self, plip_dir='data/plip', pdbbind_dir='data/pdbbind'):
+        self.plip_dir = plip_dir
+        self.pdbbind_dir = pdbbind_dir
+        self.interaction_map = {
+            "halogen": 0, "hbond": 1, "hydrophobic": 2, 
+            "metal": 3, "pication": 4, "pistacking": 5, "saltbridge": 6
+        }
+
+    def _load_mol(self, path):
+        """支持从 sdf 或 mol2 加载配体"""
+        if path.endswith('.sdf'):
+            return Chem.MolFromMolFile(path, removeHs=False)
+        elif path.endswith('.mol2'):
+            return Chem.MolFromMol2File(path, removeHs=False)
+        return None
+
+    def _get_protein_residue_map(self, protein_pdb_path):
+        """解析 PDB，建立 (链名, 残基编号) 到 GNN 索引的映射"""
+        # 注意：此处建议使用 Biopython 或简单的行解析来获取蛋白质 C-alpha 坐标
+        res_info = []
+        coords = []
+        with open(protein_pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM') and line[12:16].strip() == 'CA':
+                    res_name = line[17:20].strip()
+                    chain_id = line[21].strip()
+                    res_nr = int(line[22:26].strip())
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    res_info.append((chain_id, res_nr))
+                    coords.append([x, y, z])
+        
+        # 建立映射表 {(Chain, Nr): GNN_Index}
+        res_to_idx = {info: i for i, info in enumerate(res_info)}
+        return res_to_idx, torch.tensor(coords, dtype=torch.float)
+
+    def process_complex(self, pdb_id):
+        # 路径定义
+        plip_json = os.path.join(self.plip_dir, pdb_id, 'report.json')
+        ligand_path = os.path.join(self.pdbbind_dir, pdb_id, f'{pdb_id}_ligand.sdf')
+        protein_path = os.path.join(self.pdbbind_dir, pdb_id, f'{pdb_id}_processed_protein.pdb')
+
+        if not all(os.path.exists(p) for p in [plip_json, ligand_path, protein_path]):
+            return None
+
+        # 1. 加载配体并建立坐标树
+        mol = self._load_mol(ligand_path)
+        if mol is None: return None
+        lig_coords = mol.GetConformer().GetPositions()
+        lig_tree = KDTree(lig_coords)
+
+        # 2. 加载蛋白质残基映射
+        res_to_idx, prot_coords = self._get_protein_residue_map(protein_path)
+
+        # 3. 初始化 HeteroData
+        data = HeteroData()
+        data['ligand'].pos = torch.tensor(lig_coords, dtype=torch.float)
+        data['ligand'].x = torch.tensor([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=torch.float).view(-1, 1)
+        data['protein'].pos = prot_coords
+        data['protein'].x = torch.zeros((prot_coords.shape[0], 1)) # 实际可添加残基类型特征
+
+        # 4. 解析 PLIP JSON 并构建交互边
+        with open(plip_json, 'r') as f:
+            plip_data = json.load(f)
+
+        edge_indices = []
+        edge_attrs = []
+
+        for site_key, site_val in plip_data.get('binding_sites', {}).items():
+            interactions = site_val.get('interactions', {})
+            for itype, info in interactions.items():
+                if itype not in self.interaction_map: continue
+                
+                for record in info.get('records', []):
+                    # 匹配配体原子索引
+                    dist, lig_idx = lig_tree.query(np.array(record['LIGCOO']))
+                    if dist > 0.5: continue
+
+                    # 匹配蛋白质残基索引
+                    prot_key = (record['RESCHAIN'], record['RESNR'])
+                    if prot_key not in res_to_idx: continue
+                    prot_idx = res_to_idx[prot_key]
+
+                    # 构造 10 维特征向量
+                    attr = torch.zeros(10)
+                    attr[self.interaction_map[itype]] = 1.0 # One-hot
+                    attr[7] = record.get('DIST', record.get('DIST_D-A', record.get('CENTDIST', 0)))
+                    attr[8] = np.deg2rad(record.get('DON_ANGLE', record.get('ANGLE', 0)))
+                    attr[9] = 1.0 if record.get('SIDECHAIN', False) else 0.0 # 记录是否为侧链交互
+
+                    edge_indices.append([prot_idx, lig_idx])
+                    edge_attrs.append(attr)
+
+        if len(edge_indices) > 0:
+            data['protein', 'interacts', 'ligand'].edge_index = torch.tensor(edge_indices).t().contiguous()
+            data['protein', 'interacts', 'ligand'].edge_attr = torch.stack(edge_attrs)
+
+        return data
+
+
+针对高精度柔性对接的优化逻辑：
+残基级映射 (_get_protein_residue_map)： 由于 PLIP 使用的是 PDB 文件中的 Chain ID 和 Residue Number，代码显式提取了这些元数据。这保证了 edge_index 中的每一个索引都准确指向了发生相互作用的那个残基。
+
+侧链标志位 (attr[9])： 我将 SIDECHAIN 字段编码进了边特征中。正如你之前讨论的，在扩散过程中，模型可以根据这个标志位来决定是否对该边的蛋白质端节点施加更精细的二面角权重。
+
+多原子交互的处理： 在 pistacking 或 pication 中，PLIP 可能会涉及配体的一个环（多个原子）。为了简化，上面的代码使用了环中心坐标匹配最近的原子。如果你需要更高的精度，可以在 record 中检测 LIG_IDX_LIST，并将边连接到环上的每一个原子。
+
+接下来如何使用该数据：
+在你的 扩散模型训练循环 中，你可以这样利用这个 HeteroData：
+
+监督信号：data['protein', 'interacts', 'ligand'].edge_index 定义了理想状态下（晶体结构）必须存在的“约束网”。
+
+引导采样：在推理时，加载这个 edge_attr，利用其中存储的 attr[7] (理想距离) 和 attr[8] (理想角度) 作为 Interaction Potential 的参数，引导配体向这些约束靠拢。
+
+
+
+
+
+
+
+
+
+
