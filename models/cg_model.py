@@ -311,7 +311,7 @@ class CGModel(torch.nn.Module):
         return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, \
                rec_node_attr, data['receptor', 'receptor'].edge_index, rec_edge_attr, data['receptor', 'receptor'].edge_sh, data['receptor', 'receptor'].edge_weight
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.no_aminoacid_identities:
             data['receptor'].x = data['receptor'].x * 0
 
@@ -401,6 +401,8 @@ class CGModel(torch.nn.Module):
                 atom_confidence = torch.zeros((len(lig_node_attr),), device=lig_node_attr.device)
 
             confidence = self.confidence_predictor(scatter_mean(scalar_lig_attr, data['ligand'].batch, dim=0)).squeeze(dim=-1)
+            if return_nci:
+                return confidence, atom_confidence, nci_logits
             return confidence, atom_confidence
 
         # compute translational and rotational score vectors

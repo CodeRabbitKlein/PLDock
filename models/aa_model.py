@@ -367,7 +367,7 @@ class AAModel(torch.nn.Module):
                atom_node_attr, data['atom', 'atom'].edge_index, atom_edge_attr, data['atom', 'atom'].edge_sh, data['atom', 'atom'].edge_weight, \
                data['atom', 'receptor'].edge_index, ar_edge_attr, data['atom', 'receptor'].edge_sh, data['atom', 'receptor'].edge_weight
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.crop_beyond is not None:
             # TODO missing filtering atoms
             raise NotImplementedError
@@ -490,6 +490,8 @@ class AAModel(torch.nn.Module):
                 affinity = torch.cat([AGGREGATORS[agg](affinity) for agg in self.parallel_aggregators], dim=-1)
                 affinity = self.affinity_predictor(affinity).squeeze(dim=-1)
                 confidence = confidence, affinity
+            if return_nci:
+                return confidence, atom_confidence, nci_logits
             return confidence, atom_confidence
         assert self.parallel == 1
 
