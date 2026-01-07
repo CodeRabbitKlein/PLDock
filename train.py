@@ -40,6 +40,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     best_val_secondary_value = math.inf if args.inference_earlystop_goal == 'min' else 0
     best_epoch = 0
     best_val_inference_epoch = 0
+    baseline_nci_loss = None
+    baseline_pos_recall = None
 
     freeze_params = 0
     scheduler_mode = args.inference_earlystop_goal if args.val_inference_freq is not None else 'min'
@@ -71,6 +73,23 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                       train_losses['tor_loss'], train_losses['sidechain_loss'], train_losses['nci_loss'],
                       optimizer.param_groups[0]['lr']))
+        if epoch == 0:
+            baseline_nci_loss = train_losses['nci_loss']
+            baseline_pos_recall = train_losses['pos_recall']
+        if epoch == 1 and baseline_nci_loss is not None and baseline_pos_recall is not None:
+            l_type_decreased = train_losses['nci_loss'] < baseline_nci_loss
+            pos_recall_risen = baseline_pos_recall <= 0 and train_losses['pos_recall'] > 0
+            print(
+                "Epoch 1 check: L_type decreased={} (prev {:.4f} -> {:.4f}), "
+                "pos_recall from 0 increased={} (prev {:.4f} -> {:.4f})".format(
+                    l_type_decreased,
+                    baseline_nci_loss,
+                    train_losses['nci_loss'],
+                    pos_recall_risen,
+                    baseline_pos_recall,
+                    train_losses['pos_recall'],
+                )
+            )
 
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
