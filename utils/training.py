@@ -234,17 +234,22 @@ def _compute_nci_per_graph(logits_per_graph, labels_per_graph, device, apply_mea
 def _compute_nci_batched(nci_logits, labels, edge_batch, num_graphs, device, apply_mean, alpha_none, alpha_pos, gamma):
     if labels is None or nci_logits is None or labels.numel() == 0:
         return _empty_nci_metrics(num_graphs, device, apply_mean)
-    focal_loss = _focal_loss(nci_logits, labels, alpha_none, alpha_pos, gamma)
+    labels, valid_mask = _sanitize_nci_labels(nci_logits, labels)
+    if not valid_mask.any():
+        return _empty_nci_metrics(num_graphs, device, apply_mean)
+    focal_loss = _focal_loss(nci_logits[valid_mask], labels[valid_mask], alpha_none, alpha_pos, gamma)
     loss_sum = torch.zeros(num_graphs, dtype=torch.float, device=device)
     counts = torch.zeros(num_graphs, dtype=torch.float, device=device)
+    edge_batch = edge_batch[valid_mask]
     loss_sum.index_add_(0, edge_batch, focal_loss)
     counts.index_add_(0, edge_batch, torch.ones_like(focal_loss))
     loss_per_graph = loss_sum / (counts + 1e-6)
 
-    preds = torch.argmax(nci_logits, dim=1)
-    pos_mask = labels > 0
-    none_mask = labels == 0
-    pos_correct = ((preds == labels) & pos_mask).float()
+    preds = torch.argmax(nci_logits[valid_mask], dim=1)
+    valid_labels = labels[valid_mask]
+    pos_mask = valid_labels > 0
+    none_mask = valid_labels == 0
+    pos_correct = ((preds == valid_labels) & pos_mask).float()
     none_correct = ((preds == 0) & none_mask).float()
     pos_total = torch.zeros(num_graphs, dtype=torch.float, device=device)
     none_total = torch.zeros(num_graphs, dtype=torch.float, device=device)
@@ -269,6 +274,12 @@ def _compute_nci_batched(nci_logits, labels, edge_batch, num_graphs, device, app
 
 
 def _compute_nci_single(logits, labels, alpha_none, alpha_pos, gamma):
+    labels, valid_mask = _sanitize_nci_labels(logits, labels)
+    if not valid_mask.any():
+        zeros = torch.zeros(1, dtype=torch.float, device=logits.device)
+        return zeros.squeeze(0), zeros.squeeze(0), zeros.squeeze(0)
+    logits = logits[valid_mask]
+    labels = labels[valid_mask]
     focal_loss = _focal_loss(logits, labels, alpha_none, alpha_pos, gamma)
     loss = focal_loss.mean()
     preds = torch.argmax(logits, dim=1)
@@ -292,6 +303,13 @@ def _focal_loss(logits, labels, alpha_none, alpha_pos, gamma):
                         torch.full_like(labels, alpha_pos, dtype=logits.dtype))
     focal_term = (1 - pt) ** gamma
     return -alpha * focal_term * log_pt
+
+
+def _sanitize_nci_labels(logits, labels):
+    num_classes = logits.size(1)
+    labels = labels.long()
+    valid_mask = (labels >= 0) & (labels < num_classes)
+    return labels, valid_mask
 
 
 def _empty_nci_metrics(data_or_num_graphs, device, apply_mean):
