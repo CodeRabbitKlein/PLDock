@@ -162,6 +162,7 @@ def parse_train_args():
     parser.add_argument('--vandermers_buffer_residue_num', type=int, default=7, help='')
     parser.add_argument('--vandermers_min_contacts', type=int, default=None, help='')
     parser.add_argument('--remove_second_segment', action='store_true', default=False, help='')
+    parser.add_argument('--report_nci_mapping', action='store_true', default=False, help='Report NCI cache to graph mapping coverage')
 
     args = parser.parse_args()
 

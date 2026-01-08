@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import pickle
+import warnings
 from collections import defaultdict
 from multiprocessing import Pool
 import random
@@ -262,6 +263,18 @@ class PDBBind(Dataset):
         cache_res_chain_ids = nci_labels.get("res_chain_ids")
         cache_resnums = nci_labels.get("resnums")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        num_rec = complex_graph['receptor'].num_nodes
+        min_cache_ratio = 0.6
+        min_hit_ratio = 0.6
+        min_coverage_ratio = 0.6
+        def _warn_skip(reason):
+            warnings.warn(
+                "[NCI cache] {name}: {reason}. Skipping cached NCI labels.".format(
+                    name=complex_name,
+                    reason=reason,
+                )
+            )
+
         if cache_res_chain_ids is not None and cache_resnums is not None:
             if isinstance(cache_res_chain_ids, np.ndarray):
                 cache_res_chain_ids = cache_res_chain_ids.tolist()
@@ -269,6 +282,19 @@ class PDBBind(Dataset):
                 cache_resnums = cache_resnums.tolist()
             cache_res_chain_ids = [str(chain) for chain in cache_res_chain_ids]
             cache_resnums = [int(resnum) for resnum in cache_resnums]
+            if len(cache_resnums) == 0 or num_rec == 0:
+                _warn_skip("empty cache or receptor nodes")
+                return
+            size_ratio = min(len(cache_resnums), num_rec) / max(len(cache_resnums), num_rec)
+            if size_ratio < min_cache_ratio:
+                _warn_skip(
+                    "cache size mismatch cache_res={cache} graph_res={graph} ratio={ratio:.2f}".format(
+                        cache=len(cache_resnums),
+                        graph=num_rec,
+                        ratio=size_ratio,
+                    )
+                )
+                return
 
             curr_resnums = complex_graph['receptor'].resnums
             curr_res_chain_ids = complex_graph['receptor'].res_chain_ids
@@ -288,6 +314,24 @@ class PDBBind(Dataset):
                 mapped = current_map.get((chain, resnum))
                 if mapped is not None:
                     remap[idx] = mapped
+            mapped_mask = remap >= 0
+            hit_count = int(mapped_mask.sum().item())
+            hit_ratio = hit_count / len(cache_resnums)
+            unique_mapped = int(torch.unique(remap[mapped_mask]).numel())
+            coverage_ratio = unique_mapped / num_rec
+            if hit_ratio < min_hit_ratio or coverage_ratio < min_coverage_ratio:
+                _warn_skip(
+                    "low cache mapping hit_rate={hit:.2f} ({hit_count}/{total}) coverage={cov:.2f} "
+                    "({unique}/{total_rec})".format(
+                        hit=hit_ratio,
+                        hit_count=hit_count,
+                        total=len(cache_resnums),
+                        cov=coverage_ratio,
+                        unique=unique_mapped,
+                        total_rec=num_rec,
+                    )
+                )
+                return
             remapped_rec = remap[edge_index[1]]
             valid_edges = remapped_rec >= 0
             edge_index = torch.stack([edge_index[0], remapped_rec], dim=0)[:, valid_edges]
@@ -313,7 +357,6 @@ class PDBBind(Dataset):
                 if edge_dist is not None:
                     edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         num_lig = complex_graph['ligand'].num_nodes
-        num_rec = complex_graph['receptor'].num_nodes
         valid_edges = (
             (edge_index[0] >= 0)
             & (edge_index[0] < num_lig)
