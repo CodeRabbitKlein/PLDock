@@ -129,6 +129,10 @@ def preprocess_complex(
             "res_pos": torch.tensor(res_pos, dtype=torch.float32),
             "res_chain_ids": res_chain_ids.tolist(),
             "resnums": resnums.astype(int).tolist(),
+            "res_id_map": res_id_map,
+            "plip_total_records": int(total_records),
+            "plip_failed_records": int(failed_records),
+            "plip_filtered_records": int(filtered_records),
             "original_center": torch.tensor(protein_center, dtype=torch.float32),
             "cand_edge_index": torch.tensor(edge_index, dtype=torch.long),
             "cand_edge_y_type": torch.tensor(y_type, dtype=torch.long),
@@ -136,7 +140,9 @@ def preprocess_complex(
         },
         out_path,
     )
-    return True, f"Saved {out_path}"
+    return True, (
+        f"Saved {out_path} (cropped PLIP interactions: {filtered_records}/{total_records})"
+    )
 
 
 def main():
