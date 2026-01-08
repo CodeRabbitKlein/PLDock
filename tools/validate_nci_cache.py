@@ -27,7 +27,60 @@ def _load_cache_entry(cache_dir, complex_name):
     return None
 
 
-def check_graph(graph, idx=None, cache_dir=None):
+def _compute_nci_mapping_stats(graph, cache_entry):
+    if cache_entry is None:
+        return None
+    cache_res_chain_ids = cache_entry.get("res_chain_ids")
+    cache_resnums = cache_entry.get("resnums")
+    if cache_res_chain_ids is None or cache_resnums is None:
+        return None
+
+    if isinstance(cache_res_chain_ids, np.ndarray):
+        cache_res_chain_ids = cache_res_chain_ids.tolist()
+    if isinstance(cache_resnums, np.ndarray):
+        cache_resnums = cache_resnums.tolist()
+    cache_res_chain_ids = [str(chain) for chain in cache_res_chain_ids]
+    cache_resnums = [int(resnum) for resnum in cache_resnums]
+    if len(cache_resnums) == 0:
+        return None
+
+    curr_resnums = graph['receptor'].resnums
+    curr_res_chain_ids = graph['receptor'].res_chain_ids
+    if torch.is_tensor(curr_resnums):
+        curr_resnums = curr_resnums.cpu().numpy()
+    if torch.is_tensor(curr_res_chain_ids):
+        curr_res_chain_ids = curr_res_chain_ids.cpu().numpy()
+    curr_res_chain_ids = [str(chain) for chain in curr_res_chain_ids]
+    curr_resnums = [int(resnum) for resnum in curr_resnums]
+    num_rec = len(curr_resnums)
+    if num_rec == 0:
+        return None
+
+    current_map = {
+        (chain, resnum): idx
+        for idx, (chain, resnum) in enumerate(zip(curr_res_chain_ids, curr_resnums))
+    }
+    remap = torch.full((len(cache_resnums),), -1, dtype=torch.long)
+    for idx, (chain, resnum) in enumerate(zip(cache_res_chain_ids, cache_resnums)):
+        mapped = current_map.get((chain, resnum))
+        if mapped is not None:
+            remap[idx] = mapped
+    mapped_mask = remap >= 0
+    hit_count = int(mapped_mask.sum().item())
+    hit_rate = hit_count / len(cache_resnums)
+    unique_mapped = int(torch.unique(remap[mapped_mask]).numel())
+    coverage_rate = unique_mapped / num_rec
+    return {
+        "hit_rate": hit_rate,
+        "hit_count": hit_count,
+        "cache_res": len(cache_resnums),
+        "coverage_rate": coverage_rate,
+        "coverage_count": unique_mapped,
+        "graph_res": num_rec,
+    }
+
+
+def check_graph(graph, idx=None, cache_dir=None, report_nci_mapping=False):
     if ('ligand', 'nci_cand', 'receptor') not in graph.edge_types:
         return True
 
@@ -87,16 +140,32 @@ def check_graph(graph, idx=None, cache_dir=None):
                     )
                 )
                 return False
+        if report_nci_mapping and cache_entry is not None:
+            mapping_stats = _compute_nci_mapping_stats(graph, cache_entry)
+            if mapping_stats is not None:
+                print(
+                    "[NCI mapping] graph={idx} name={name} hit_rate={hit:.3f} ({hit_count}/{cache}) "
+                    "coverage={cov:.3f} ({coverage_count}/{graph_res})".format(
+                        idx=idx,
+                        name=complex_name,
+                        hit=mapping_stats["hit_rate"],
+                        hit_count=mapping_stats["hit_count"],
+                        cache=mapping_stats["cache_res"],
+                        cov=mapping_stats["coverage_rate"],
+                        coverage_count=mapping_stats["coverage_count"],
+                        graph_res=mapping_stats["graph_res"],
+                    )
+                )
 
     return True
 
 
-def validate_dataset(dataset, name, cache_dir=None):
+def validate_dataset(dataset, name, cache_dir=None, report_nci_mapping=False):
     bad = 0
     total = len(dataset)
     for i in range(total):
         graph = dataset.get(i)
-        if not check_graph(graph, idx=i, cache_dir=cache_dir):
+        if not check_graph(graph, idx=i, cache_dir=cache_dir, report_nci_mapping=report_nci_mapping):
             bad += 1
     print("{name}: {bad}/{total} graphs failed NCI cache checks.".format(
         name=name, bad=bad, total=total
@@ -110,11 +179,21 @@ def main():
     cache_dir = getattr(args, "nci_cache_path", None)
 
     print("Validating train dataset (remove_hs={}).".format(args.remove_hs))
-    validate_dataset(train_loader.dataset, "train", cache_dir=cache_dir)
+    validate_dataset(
+        train_loader.dataset,
+        "train",
+        cache_dir=cache_dir,
+        report_nci_mapping=args.report_nci_mapping,
+    )
 
     if val_loader is not None:
         print("Validating val dataset (remove_hs={}).".format(args.remove_hs))
-        validate_dataset(val_loader.dataset, "val", cache_dir=cache_dir)
+        validate_dataset(
+            val_loader.dataset,
+            "val",
+            cache_dir=cache_dir,
+            report_nci_mapping=args.report_nci_mapping,
+        )
 
 
 if __name__ == "__main__":
