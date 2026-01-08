@@ -468,6 +468,7 @@ class MOAD(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
+        self._report_nci_stats_once(complex_names_all)
 
         # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
         list_indices = list(range(len(complex_names_all)//1000+1))
