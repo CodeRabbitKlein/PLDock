@@ -270,6 +270,15 @@ class PDBBind(Dataset):
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
+        stats_enabled = os.environ.get("DIFFDOCK_PREPROCESS_STATS", "").lower() in {"1", "true", "yes", "on"}
+        log_every = int(os.environ.get("DIFFDOCK_PREPROCESS_LOG_EVERY", "200"))
+        total_start_time = None
+        if stats_enabled:
+            import time
+            total_start_time = time.perf_counter()
+        processed = 0
+        success = 0
+        failed = 0
 
         complex_names_all = read_strings_from_txt(self.split_path)
         if self.limit_complexes is not None and self.limit_complexes != 0:
@@ -302,6 +311,10 @@ class PDBBind(Dataset):
         for i in list_indices:
             if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
                 continue
+            import time
+            batch_start = time.perf_counter()
+            batch_processed = 0
+            batch_failed = 0
             complex_names = complex_names_all[1000*i:1000*(i+1)]
             lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
             complex_graphs, rdkit_ligands = [], []
@@ -313,13 +326,33 @@ class PDBBind(Dataset):
                 for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
                     complex_graphs.extend(t[0])
                     rdkit_ligands.extend(t[1])
+                    batch_processed += 1
+                    processed += 1
+                    if len(t[0]) == 0:
+                        batch_failed += 1
+                        failed += 1
+                    else:
+                        success += 1
+                    if stats_enabled and processed % log_every == 0:
+                        total_elapsed_s = time.perf_counter() - total_start_time
+                        print(
+                            f"[preprocess] processed={processed} success={success} failed={failed} "
+                            f"elapsed={total_elapsed_s:.1f}s"
+                        )
                     pbar.update()
             if self.num_workers > 1: p.__exit__(None, None, None)
 
             with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                 pickle.dump((complex_graphs), f)
-        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-            pickle.dump((rdkit_ligands), f)
+            with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+                pickle.dump((rdkit_ligands), f)
+            if stats_enabled:
+                batch_elapsed = time.perf_counter() - batch_start
+                batch_fail_rate = (batch_failed / max(batch_processed, 1)) * 100.0
+                print(
+                    f"[preprocess] batch={i} wrote {len(complex_graphs)} graphs "
+                    f"in {batch_elapsed:.1f}s fail_rate={batch_fail_rate:.2f}%"
+                )
 
     def inference_preprocessing(self):
         ligands_list = []
