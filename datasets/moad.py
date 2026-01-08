@@ -295,7 +295,10 @@ class MOAD(Dataset):
         nci_labels = self._load_nci_labels(ligand_name)
         if nci_labels is None:
             return
-        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if "cand_edge_index" in nci_labels:
+            edge_index = nci_labels["cand_edge_index"]
+        else:
+            edge_index = nci_labels.get("edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
@@ -477,6 +480,7 @@ class MOAD(Dataset):
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} ligands.')
+        self._report_nci_stats_once(complex_names_all)
 
         # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
         list_indices = list(range(len(complex_names_all)//1000+1))

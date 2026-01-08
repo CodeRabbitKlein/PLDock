@@ -1,4 +1,6 @@
 import copy
+import os
+import time
 import warnings
 import numpy as np
 import torch
@@ -137,6 +139,7 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
     res_chain_ids = pdb.ca.getChids()
     res_seg_ids = pdb.ca.getSegnames()
     res_chain_ids = np.asarray([s + c for s, c in zip(res_seg_ids, res_chain_ids)])
+    resnums = np.asarray(pdb.ca.getResnums())
     ids = np.unique(res_chain_ids)
     sequences = []
     lm_embeddings = lm_embeddings if sequences_to_embeddings is None else []
@@ -152,6 +155,8 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
 
     complex_graph['receptor'].sequence = sequences
     complex_graph['receptor'].chain_ids = torch.from_numpy(np.asarray(chain_ids)).long()
+    complex_graph['receptor'].resnums = torch.from_numpy(resnums).long()
+    complex_graph['receptor'].res_chain_ids = res_chain_ids
 
     new_extract_receptor_structure(seq, coords, complex_graph, neighbor_cutoff=neighbor_cutoff, max_neighbors=max_neighbors,
                                    lm_embeddings=lm_embeddings, knn_only_graph=knn_only_graph, all_atoms=all_atoms,
@@ -301,8 +306,24 @@ def get_lig_graph(mol, complex_graph):
     return
 
 
+_CONFORMER_STATS = {
+    "attempted": 0,
+    "success": 0,
+    "failed": 0,
+    "fallback": 0,
+}
+
+
+def _stats_enabled():
+    return os.environ.get("DIFFDOCK_PREPROCESS_STATS", "").lower() in {"1", "true", "yes", "on"}
+
+
 def generate_conformer(mol):
     """生成分子的3D构象，包含多种优化策略"""
+    stats_enabled = _stats_enabled()
+    start_time = time.perf_counter() if stats_enabled else None
+    _CONFORMER_STATS["attempted"] += 1
+    max_failures = int(os.environ.get("DIFFDOCK_CONFORMER_FAIL_THRESHOLD", "0"))
     
     # 预处理分子，确保合理的化学结构
     try:
@@ -320,6 +341,12 @@ def generate_conformer(mol):
             get_logger().debug(f'rdkit coords could not be generated. trying again {failures}.')
         id = AllChem.EmbedMolecule(mol, ps)
         failures += 1
+        if id == -1 and max_failures > 0 and failures >= max_failures:
+            _CONFORMER_STATS["failed"] += 1
+            if stats_enabled and start_time is not None:
+                elapsed = time.perf_counter() - start_time
+                get_logger().warning(f'Conformer generation aborted after {elapsed:.2f}s and {failures} attempts.')
+            raise RuntimeError(f"Conformer generation failed after {failures} attempts.")
     
     if id == -1:
         get_logger().info('rdkit coords could not be generated without using random coords. using random coords now.')
@@ -338,14 +365,28 @@ def generate_conformer(mol):
             
             if id == -1:
                 get_logger().error('All conformer generation methods failed. Molecule may have structural issues.')
+                _CONFORMER_STATS["failed"] += 1
+                if stats_enabled and start_time is not None:
+                    elapsed = time.perf_counter() - start_time
+                    get_logger().warning(f'Conformer generation failed after {elapsed:.2f}s.')
+                if max_failures > 0 and failures >= max_failures:
+                    raise RuntimeError(f"Conformer generation failed after {failures} attempts.")
                 return False
 
         # 新的_optimize_molecule()辅助函数，实现多种优化方法的智能切换
         _optimize_molecule(mol)
+        _CONFORMER_STATS["fallback"] += 1
+        if stats_enabled and start_time is not None:
+            elapsed = time.perf_counter() - start_time
+            get_logger().debug(f'Conformer generation fallback succeeded in {elapsed:.2f}s.')
         return True
     
     # 如果ETKDG成功，也可以尝试优化
     # _optimize_molecule(mol)
+    _CONFORMER_STATS["success"] += 1
+    if stats_enabled and start_time is not None:
+        elapsed = time.perf_counter() - start_time
+        get_logger().debug(f'Conformer generation succeeded in {elapsed:.2f}s.')
     return False
 
 '''

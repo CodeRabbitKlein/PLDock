@@ -228,7 +228,10 @@ class PDBBind(Dataset):
         nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
             return
-        edge_index = nci_labels.get("cand_edge_index") or nci_labels.get("edge_index")
+        if "cand_edge_index" in nci_labels:
+            edge_index = nci_labels["cand_edge_index"]
+        else:
+            edge_index = nci_labels.get("edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
@@ -277,13 +280,46 @@ class PDBBind(Dataset):
                     return {key: data[key] for key in data.files}
         return None
 
+    def _has_nci_labels(self, complex_name):
+        if self.nci_cache_path is None:
+            return False
+        candidates = []
+        if complex_name:
+            candidates.extend([complex_name, complex_name[:4], complex_name[:6]])
+        for candidate in dict.fromkeys(candidates):
+            for ext in (".pt", ".npz"):
+                path = os.path.join(self.nci_cache_path, f"{candidate}{ext}")
+                if os.path.exists(path):
+                    return True
+        return False
+
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        if getattr(self, "_nci_stats_reported", False):
+            return
+        self._nci_stats_reported = True
+        total = len(complex_names)
+        found = sum(1 for name in complex_names if self._has_nci_labels(name))
+        print(f'NCI labels available for {found}/{total} complexes in {self.nci_cache_path}')
+
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
+        stats_enabled = os.environ.get("DIFFDOCK_PREPROCESS_STATS", "").lower() in {"1", "true", "yes", "on"}
+        log_every = int(os.environ.get("DIFFDOCK_PREPROCESS_LOG_EVERY", "200"))
+        total_start_time = None
+        if stats_enabled:
+            import time
+            total_start_time = time.perf_counter()
+        processed = 0
+        success = 0
+        failed = 0
 
         complex_names_all = read_strings_from_txt(self.split_path)
         if self.limit_complexes is not None and self.limit_complexes != 0:
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
+        self._report_nci_stats_once(complex_names_all)
 
         if self.esm_embeddings_path is not None:
             id_to_embeddings = torch.load(self.esm_embeddings_path)
@@ -310,6 +346,10 @@ class PDBBind(Dataset):
         for i in list_indices:
             if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
                 continue
+            import time
+            batch_start = time.perf_counter()
+            batch_processed = 0
+            batch_failed = 0
             complex_names = complex_names_all[1000*i:1000*(i+1)]
             lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
             complex_graphs, rdkit_ligands = [], []
@@ -321,6 +361,19 @@ class PDBBind(Dataset):
                 for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
                     complex_graphs.extend(t[0])
                     rdkit_ligands.extend(t[1])
+                    batch_processed += 1
+                    processed += 1
+                    if len(t[0]) == 0:
+                        batch_failed += 1
+                        failed += 1
+                    else:
+                        success += 1
+                    if stats_enabled and processed % log_every == 0:
+                        total_elapsed_s = time.perf_counter() - total_start_time
+                        print(
+                            f"[preprocess] processed={processed} success={success} failed={failed} "
+                            f"elapsed={total_elapsed_s:.1f}s"
+                        )
                     pbar.update()
             if self.num_workers > 1: p.__exit__(None, None, None)
 
@@ -328,6 +381,13 @@ class PDBBind(Dataset):
                 pickle.dump((complex_graphs), f)
             with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
                 pickle.dump((rdkit_ligands), f)
+            if stats_enabled:
+                batch_elapsed = time.perf_counter() - batch_start
+                batch_fail_rate = (batch_failed / max(batch_processed, 1)) * 100.0
+                print(
+                    f"[preprocess] batch={i} wrote {len(complex_graphs)} graphs "
+                    f"in {batch_elapsed:.1f}s fail_rate={batch_fail_rate:.2f}%"
+                )
 
     def inference_preprocessing(self):
         ligands_list = []

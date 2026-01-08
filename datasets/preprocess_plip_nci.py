@@ -4,11 +4,13 @@ import os
 
 import numpy as np
 import torch
-from rdkit import Chem
+import yaml
 from scipy.spatial import cKDTree
 import prody as pr
+from torch_geometric.data import HeteroData
 
 from datasets.pdbbind import read_mol
+from datasets.process_mols import moad_extract_receptor_structure
 
 
 def get_ligand_positions(pdbbind_dir, pdb_id, ligand_file="ligand", remove_hs=False):
@@ -45,6 +47,9 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
         if dist <= threshold:
             return int(idx), float(dist)
     return None, float(dist)
+
+
+PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
 
 
 def parse_plip_records(report, lig_pos, res_key_to_idx):
@@ -89,14 +94,17 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                 if interaction_type in {"pistacking", "pication"}:
                     lig_idx_list = record.get("LIG_IDX_LIST")
                     if lig_idx_list:
-                        lig_indices = list(range(lig_pos.shape[0]))
+                        lig_indices = parse_lig_idx_list(lig_idx_list, lig_pos.shape[0])
+                        if not lig_indices:
+                            lig_indices = None
 
                 if lig_indices is None:
                     lig_coord = record.get("LIGCOO")
                     if lig_coord is None:
                         failed_records += 1
                         continue
-                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord)
+                    thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
+                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
                     if lig_idx is None:
                         failed_records += 1
                         continue
@@ -110,6 +118,22 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                         pos_dist[key] = dist_value
 
     return pos_map, pos_dist, total_records, failed_records
+
+
+def parse_lig_idx_list(lig_idx_list, num_atoms):
+    if isinstance(lig_idx_list, str):
+        tokens = [t.strip() for t in lig_idx_list.split(",") if t.strip()]
+        indices = [int(tok) for tok in tokens]
+    elif isinstance(lig_idx_list, (list, tuple, np.ndarray)):
+        indices = [int(v) for v in lig_idx_list]
+    else:
+        return []
+    if not indices:
+        return []
+    max_idx = max(indices)
+    if max_idx >= num_atoms:
+        indices = [idx - 1 for idx in indices]
+    return [idx for idx in indices if 0 <= idx < num_atoms]
 
 
 def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):
@@ -176,6 +200,8 @@ def preprocess_complex(
     neg_min=10,
     neg_max=200,
     bad_ratio=0.3,
+    use_training_graph=False,
+    training_graph_params=None,
 ):
     report_path = os.path.join(plip_dir, pdb_id, "report.json")
     if not os.path.exists(report_path):
@@ -253,6 +279,9 @@ def main():
     parser.add_argument("--bad_ratio", type=float, default=0.3)
     args = parser.parse_args()
 
+    use_training_graph = args.use_training_graph or args.training_args is not None
+    training_graph_params = resolve_training_graph_params(args) if use_training_graph else None
+
     if args.split_file:
         with open(args.split_file, "r", encoding="utf-8") as f:
             pdb_ids = [line.strip() for line in f if line.strip()]
@@ -281,6 +310,8 @@ def main():
                 neg_min=args.neg_min,
                 neg_max=args.neg_max,
                 bad_ratio=args.bad_ratio,
+                use_training_graph=use_training_graph,
+                training_graph_params=training_graph_params,
             )
         except Exception as exc:
             ok, msg = False, f"Failed {pdb_id}: {exc}"

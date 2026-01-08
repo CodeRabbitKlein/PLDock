@@ -311,7 +311,7 @@ class CGModel(torch.nn.Module):
         return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, \
                rec_node_attr, data['receptor', 'receptor'].edge_index, rec_edge_attr, data['receptor', 'receptor'].edge_sh, data['receptor', 'receptor'].edge_weight
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.no_aminoacid_identities:
             data['receptor'].x = data['receptor'].x * 0
 
@@ -338,8 +338,14 @@ class CGModel(torch.nn.Module):
             lr_keys = lr_edge_index[0] * num_rec + lr_edge_index[1]
             cand_keys = cand_edge_index[0] * num_rec + cand_edge_index[1]
             lr_sorted, lr_order = torch.sort(lr_keys)
-            cand_pos = torch.searchsorted(lr_sorted, cand_keys)
-            valid = (cand_pos < lr_sorted.numel()) & (lr_sorted[cand_pos] == cand_keys)
+            if lr_sorted.numel() == 0:
+                valid = torch.zeros_like(cand_keys, dtype=torch.bool)
+                cand_pos = torch.zeros_like(cand_keys)
+            else:
+                cand_pos = torch.searchsorted(lr_sorted, cand_keys)
+                in_bounds = cand_pos < lr_sorted.numel()
+                valid = in_bounds.clone()
+                valid[in_bounds] = lr_sorted[cand_pos[in_bounds]] == cand_keys[in_bounds]
 
             rbf = torch.zeros((cand_edge_index.size(1), self.cross_distance_embed_dim), device=lig_node_attr.device)
             if valid.any():
@@ -395,6 +401,8 @@ class CGModel(torch.nn.Module):
                 atom_confidence = torch.zeros((len(lig_node_attr),), device=lig_node_attr.device)
 
             confidence = self.confidence_predictor(scatter_mean(scalar_lig_attr, data['ligand'].batch, dim=0)).squeeze(dim=-1)
+            if return_nci:
+                return confidence, atom_confidence, nci_logits
             return confidence, atom_confidence
 
         # compute translational and rotational score vectors
