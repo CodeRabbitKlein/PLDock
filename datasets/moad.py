@@ -290,10 +290,22 @@ class MOAD(Dataset):
         return complexes
 
     def _add_nci_edges(self, complex_graph, ligand_name):
+        nci_edge_type = ('ligand', 'nci_cand', 'receptor')
+        def _cleanup_edge_store():
+            if nci_edge_type in complex_graph.edge_types:
+                edge_store = complex_graph[nci_edge_type]
+                edge_store.edge_index = torch.empty((2, 0), dtype=torch.long)
+                if hasattr(edge_store, 'edge_type_y'):
+                    edge_store.edge_type_y = None
+                if hasattr(edge_store, 'edge_dist_y'):
+                    edge_store.edge_dist_y = None
+
         if self.nci_cache_path is None:
+            _cleanup_edge_store()
             return
         nci_labels = self._load_nci_labels(ligand_name)
         if nci_labels is None:
+            _cleanup_edge_store()
             return
         def _get_label(labels, *keys):
             for key in keys:
@@ -305,6 +317,7 @@ class MOAD(Dataset):
 
         edge_index = _get_label(nci_labels, "cand_edge_index", "edge_index")
         if edge_index is None:
+            _cleanup_edge_store()
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
@@ -314,7 +327,6 @@ class MOAD(Dataset):
         cache_res_pos = nci_labels.get("res_pos")
         cache_res_chain_ids = nci_labels.get("res_chain_ids")
         cache_resnums = nci_labels.get("resnums")
-        nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         if cache_res_chain_ids is not None and cache_resnums is not None:
             if isinstance(cache_res_chain_ids, np.ndarray):
                 cache_res_chain_ids = cache_res_chain_ids.tolist()
@@ -379,6 +391,7 @@ class MOAD(Dataset):
                 edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
             if edge_dist is not None:
                 edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        nci_edge = complex_graph[nci_edge_type]
         nci_edge.edge_index = edge_index
         if edge_type is not None:
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
