@@ -32,8 +32,9 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
     res_pos = np.asarray(ca.getCoords(), dtype=np.float32)
     resnums = np.asarray(ca.getResnums())
     chains = np.asarray(ca.getChids())
-    res_key_to_idx = {(chain, int(resnum)): idx for idx, (chain, resnum) in enumerate(zip(chains, resnums))}
-    return res_pos, res_key_to_idx
+    res_keys = [(chain, int(resnum)) for chain, resnum in zip(chains, resnums)]
+    res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
+    return res_pos, res_key_to_idx, res_keys
 
 
 def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
@@ -189,6 +190,7 @@ def preprocess_complex(
     ligand_file="ligand",
     protein_file="protein_processed",
     remove_hs=False,
+    chain_cutoff=None,
     cutoff=10.0,
     neg_per_pos=20,
     neg_min=10,
@@ -202,7 +204,16 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    res_pos, res_key_to_idx = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
+    res_pos, res_key_to_idx, res_keys = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
+    if chain_cutoff is not None:
+        diff = lig_pos[:, None, :] - res_pos[None, :, :]
+        min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
+        keep = min_dist < chain_cutoff
+        if not np.any(keep):
+            return False, f"No receptor residues within chain_cutoff for {pdb_id}"
+        res_pos = res_pos[keep]
+        res_keys = [res_keys[i] for i in np.where(keep)[0]]
+        res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
 
     pos_map, pos_dist, total_records, failed_records = parse_plip_records(report, lig_pos, res_key_to_idx)
     if total_records > 0 and failed_records / total_records > bad_ratio:
@@ -244,6 +255,7 @@ def main():
     parser.add_argument("--ligand_file", default="ligand", help="Ligand file suffix")
     parser.add_argument("--protein_file", default="protein_processed", help="Protein file suffix")
     parser.add_argument("--remove_hs", action="store_true", default=False, help="Remove hydrogens from ligand")
+    parser.add_argument("--chain_cutoff", type=float, default=None, help="Match training chain cutoff for receptors")
     parser.add_argument("--cutoff", type=float, default=10.0)
     parser.add_argument("--neg_per_pos", type=int, default=20)
     parser.add_argument("--neg_min", type=int, default=10)
@@ -272,6 +284,7 @@ def main():
                 ligand_file=args.ligand_file,
                 protein_file=args.protein_file,
                 remove_hs=args.remove_hs,
+                chain_cutoff=args.chain_cutoff,
                 cutoff=args.cutoff,
                 neg_per_pos=args.neg_per_pos,
                 neg_min=args.neg_min,
