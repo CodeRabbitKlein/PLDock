@@ -11,8 +11,8 @@ import prody as pr
 from datasets.pdbbind import read_mol
 
 
-def get_ligand_positions(pdbbind_dir, pdb_id, ligand_file="ligand"):
-    lig = read_mol(pdbbind_dir, pdb_id, suffix=ligand_file, remove_hs=False)
+def get_ligand_positions(pdbbind_dir, pdb_id, ligand_file="ligand", remove_hs=False):
+    lig = read_mol(pdbbind_dir, pdb_id, suffix=ligand_file, remove_hs=remove_hs)
     if lig is None:
         raise ValueError(f"Failed to read ligand for {pdb_id}")
     if lig.GetNumConformers() == 0:
@@ -167,6 +167,7 @@ def preprocess_complex(
     cache_dir,
     ligand_file="ligand",
     protein_file="protein_processed",
+    remove_hs=False,
     cutoff=10.0,
     neg_per_pos=20,
     neg_min=10,
@@ -179,7 +180,7 @@ def preprocess_complex(
     with open(report_path, "r", encoding="utf-8") as f:
         report = json.load(f)
 
-    lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file)
+    lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
     res_pos, res_key_to_idx = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
 
     pos_map, pos_dist, total_records, failed_records = parse_plip_records(report, lig_pos, res_key_to_idx)
@@ -221,6 +222,7 @@ def main():
     parser.add_argument("--split_file", default=None, help="Optional split file containing PDB IDs")
     parser.add_argument("--ligand_file", default="ligand", help="Ligand file suffix")
     parser.add_argument("--protein_file", default="protein_processed", help="Protein file suffix")
+    parser.add_argument("--remove_hs", action="store_true", default=False, help="Remove hydrogens from ligand")
     parser.add_argument("--cutoff", type=float, default=10.0)
     parser.add_argument("--neg_per_pos", type=int, default=20)
     parser.add_argument("--neg_min", type=int, default=10)
@@ -248,6 +250,7 @@ def main():
                 args.cache_dir,
                 ligand_file=args.ligand_file,
                 protein_file=args.protein_file,
+                remove_hs=args.remove_hs,
                 cutoff=args.cutoff,
                 neg_per_pos=args.neg_per_pos,
                 neg_min=args.neg_min,
