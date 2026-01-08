@@ -219,7 +219,18 @@ class PDBBind(Dataset):
             if hasattr(complex_graph['receptor'], a):
                 delattr(complex_graph['receptor'], a)
 
-        self._add_nci_edges(complex_graph)
+        nci_edge = None
+        try:
+            nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        except KeyError:
+            nci_edge = None
+        has_cached_nci = (
+            nci_edge is not None
+            and hasattr(nci_edge, 'edge_type_y')
+            and nci_edge.edge_type_y is not None
+        )
+        if not has_cached_nci:
+            self._add_nci_edges(complex_graph)
         return complex_graph
 
     def _add_nci_edges(self, complex_graph):
