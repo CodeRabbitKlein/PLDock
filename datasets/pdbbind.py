@@ -360,18 +360,33 @@ class PDBBind(Dataset):
 
         lig_pos_np = lig_pos.detach().cpu().numpy() if torch.is_tensor(lig_pos) else np.asarray(lig_pos)
         res_pos_np = res_pos.detach().cpu().numpy() if torch.is_tensor(res_pos) else np.asarray(res_pos)
+        res_id_map = None
+        res_chain_ids = getattr(complex_graph['receptor'], "res_chain_ids", None)
+        resnums = getattr(complex_graph['receptor'], "resnums", None)
+        if res_chain_ids is not None and resnums is not None:
+            if torch.is_tensor(res_chain_ids):
+                res_chain_ids = res_chain_ids.cpu().numpy()
+            if torch.is_tensor(resnums):
+                resnums = resnums.cpu().numpy()
+            res_chain_ids = [str(chain) for chain in res_chain_ids]
+            resnums = [int(resnum) for resnum in resnums]
+            res_id_map = {
+                (chain, resnum): idx for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
+            }
 
         try:
-            pos_map, pos_dist, total_records, failed_records = parse_plip_records(
+            pos_map, pos_dist, total_records, failed_records, filtered_records = parse_plip_records(
                 report,
                 lig_pos_np,
                 res_pos_np,
                 center=center,
+                res_id_map=res_id_map,
             )
         except ValueError:
             return
         bad_ratio = 0.3
-        if total_records > 0 and failed_records / total_records > bad_ratio:
+        failed_total = failed_records + filtered_records
+        if total_records > 0 and failed_total / total_records > bad_ratio:
             return
 
         lig_idx, res_idx = build_candidate_edges(lig_pos_np, res_pos_np, cutoff=10.0)
@@ -760,7 +775,7 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
     return None, float(dist)
 
 
-def parse_plip_records(report, lig_pos, res_pos, center=None):
+def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, use_res_id=True):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
         raise ValueError("Missing type_to_idx in PLIP report")
@@ -770,6 +785,7 @@ def parse_plip_records(report, lig_pos, res_pos, center=None):
     pos_dist = {}
     total_records = 0
     failed_records = 0
+    filtered_records = 0
 
     for site in report.get("binding_sites", {}).values():
         interactions = site.get("interactions", {})
@@ -777,13 +793,27 @@ def parse_plip_records(report, lig_pos, res_pos, center=None):
             records = payload.get("records", []) if isinstance(payload, dict) else []
             for record in records:
                 total_records += 1
-                prot_coord = record.get("PROTCOO")
-                if prot_coord is None:
-                    failed_records += 1
-                    continue
-                if center is not None:
-                    prot_coord = np.asarray(prot_coord, dtype=np.float32) - center
-                res_idx = int(res_tree.query(prot_coord, k=1)[1])
+                res_idx = None
+                res_chain = record.get("RESCHAIN")
+                res_nr = record.get("RESNR")
+                if use_res_id and res_id_map is not None and res_chain is not None and res_nr is not None:
+                    try:
+                        res_key = (str(res_chain), int(res_nr))
+                    except (TypeError, ValueError):
+                        res_key = (str(res_chain), res_nr)
+                    res_idx = res_id_map.get(res_key)
+                    if res_idx is None:
+                        filtered_records += 1
+                        continue
+                else:
+                    prot_coord = record.get("PROTCOO")
+                    if prot_coord is None:
+                        failed_records += 1
+                        continue
+                    if center is not None:
+                        prot_coord = np.asarray(prot_coord, dtype=np.float32) - center
+                    res_idx = int(res_tree.query(prot_coord, k=1)[1])
+                res_idx = int(res_idx)
 
                 type_id = type_to_idx.get(interaction_type)
                 if type_id is None:
@@ -825,7 +855,7 @@ def parse_plip_records(report, lig_pos, res_pos, center=None):
                         pos_map[key] = type_id
                         pos_dist[key] = dist_value
 
-    return pos_map, pos_dist, total_records, failed_records
+    return pos_map, pos_dist, total_records, failed_records, filtered_records
 
 
 def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):

@@ -95,14 +95,19 @@ def preprocess_complex(
     res_pos = res_pos - protein_center
     lig_pos = lig_pos - protein_center
 
-    pos_map, pos_dist, total_records, failed_records = parse_plip_records(
+    res_id_map = {
+        (str(chain), int(resnum)): idx for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
+    }
+    pos_map, pos_dist, total_records, failed_records, filtered_records = parse_plip_records(
         report,
         lig_pos,
         res_pos,
         center=protein_center,
+        res_id_map=res_id_map,
     )
-    if total_records > 0 and failed_records / total_records > bad_ratio:
-        return False, f"Bad sample {pdb_id}: mapping fail ratio {failed_records}/{total_records}"
+    failed_total = failed_records + filtered_records
+    if total_records > 0 and failed_total / total_records > bad_ratio:
+        return False, f"Bad sample {pdb_id}: mapping fail ratio {failed_total}/{total_records}"
 
     lig_idx, res_idx = build_candidate_edges(lig_pos, res_pos, cutoff=cutoff)
     edge_index = negative_sample_edges(
