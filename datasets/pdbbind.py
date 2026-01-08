@@ -340,17 +340,6 @@ class PDBBind(Dataset):
         if lig_pos is None or res_pos is None:
             return
 
-        resnums = complex_graph['receptor'].resnums
-        res_chain_ids = complex_graph['receptor'].res_chain_ids
-        if torch.is_tensor(resnums):
-            resnums = resnums.cpu().numpy()
-        if torch.is_tensor(res_chain_ids):
-            res_chain_ids = res_chain_ids.cpu().numpy()
-        res_chain_ids = [str(chain) for chain in res_chain_ids]
-        resnums = [int(resnum) for resnum in resnums]
-        res_keys = [(chain, resnum) for chain, resnum in zip(res_chain_ids, resnums)]
-        res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
-
         center = None
         if hasattr(complex_graph, "original_center"):
             center = complex_graph.original_center
@@ -365,7 +354,7 @@ class PDBBind(Dataset):
             pos_map, pos_dist, total_records, failed_records = parse_plip_records(
                 report,
                 lig_pos_np,
-                res_key_to_idx,
+                res_pos_np,
                 center=center,
             )
         except ValueError:
@@ -760,11 +749,12 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
     return None, float(dist)
 
 
-def parse_plip_records(report, lig_pos, res_key_to_idx, center=None):
+def parse_plip_records(report, lig_pos, res_pos, center=None):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
         raise ValueError("Missing type_to_idx in PLIP report")
     lig_tree = cKDTree(lig_pos)
+    res_tree = cKDTree(res_pos)
     pos_map = {}
     pos_dist = {}
     total_records = 0
@@ -776,16 +766,13 @@ def parse_plip_records(report, lig_pos, res_key_to_idx, center=None):
             records = payload.get("records", []) if isinstance(payload, dict) else []
             for record in records:
                 total_records += 1
-                res_chain = record.get("RESCHAIN")
-                res_num = record.get("RESNR")
-                if res_chain is None or res_num is None:
+                prot_coord = record.get("PROTCOO")
+                if prot_coord is None:
                     failed_records += 1
                     continue
-                res_key = (str(res_chain), int(res_num))
-                res_idx = res_key_to_idx.get(res_key)
-                if res_idx is None:
-                    failed_records += 1
-                    continue
+                if center is not None:
+                    prot_coord = np.asarray(prot_coord, dtype=np.float32) - center
+                res_idx = int(res_tree.query(prot_coord, k=1)[1])
 
                 type_id = type_to_idx.get(interaction_type)
                 if type_id is None:

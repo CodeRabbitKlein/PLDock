@@ -41,9 +41,7 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
     chains = np.asarray(ca.getChids())
     segnames = np.asarray(ca.getSegnames())
     res_chain_ids = np.asarray([str(seg) + str(chain) for seg, chain in zip(segnames, chains)])
-    res_keys = [(chain, int(resnum)) for chain, resnum in zip(res_chain_ids, resnums)]
-    res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
-    return res_pos, res_key_to_idx, res_keys, res_chain_ids, resnums
+    return res_pos, res_chain_ids, resnums
 
 
 def preprocess_complex(
@@ -69,7 +67,7 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    res_pos, res_key_to_idx, res_keys, res_chain_ids, resnums = get_receptor_positions(
+    res_pos, res_chain_ids, resnums = get_receptor_positions(
         pdbbind_dir,
         pdb_id,
         protein_file=protein_file,
@@ -81,10 +79,8 @@ def preprocess_complex(
         if not np.any(keep):
             return False, f"No receptor residues within receptor_radius for {pdb_id}"
         res_pos = res_pos[keep]
-        res_keys = [res_keys[i] for i in np.where(keep)[0]]
         res_chain_ids = res_chain_ids[keep]
         resnums = resnums[keep]
-        res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
     if chain_cutoff is not None:
         diff = lig_pos[:, None, :] - res_pos[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
@@ -92,10 +88,8 @@ def preprocess_complex(
         if not np.any(keep):
             return False, f"No receptor residues within chain_cutoff for {pdb_id}"
         res_pos = res_pos[keep]
-        res_keys = [res_keys[i] for i in np.where(keep)[0]]
         res_chain_ids = res_chain_ids[keep]
         resnums = resnums[keep]
-        res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
 
     protein_center = res_pos.mean(axis=0, keepdims=False).astype(np.float32)
     res_pos = res_pos - protein_center
@@ -104,7 +98,7 @@ def preprocess_complex(
     pos_map, pos_dist, total_records, failed_records = parse_plip_records(
         report,
         lig_pos,
-        res_key_to_idx,
+        res_pos,
         center=protein_center,
     )
     if total_records > 0 and failed_records / total_records > bad_ratio:
