@@ -5,11 +5,15 @@ import os
 import numpy as np
 import torch
 import yaml
-from scipy.spatial import cKDTree
 import prody as pr
-from torch_geometric.data import HeteroData
 
-from datasets.pdbbind import read_mol
+from datasets.pdbbind import (
+    read_mol,
+    parse_plip_records,
+    build_candidate_edges,
+    negative_sample_edges,
+    build_edge_labels,
+)
 from datasets.process_mols import moad_extract_receptor_structure
 
 
@@ -40,153 +44,6 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
     res_keys = [(chain, int(resnum)) for chain, resnum in zip(res_chain_ids, resnums)]
     res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
     return res_pos, res_key_to_idx, res_keys, res_chain_ids, resnums
-
-
-def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
-    coord = np.asarray(coord, dtype=np.float32)
-    dist, idx = lig_tree.query(coord, k=1)
-    for threshold in thresholds:
-        if dist <= threshold:
-            return int(idx), float(dist)
-    return None, float(dist)
-
-
-PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
-
-
-def parse_plip_records(report, lig_pos, res_key_to_idx, center=None):
-    type_to_idx = report.get("type_to_idx", {})
-    if not type_to_idx:
-        raise ValueError("Missing type_to_idx in PLIP report")
-    lig_tree = cKDTree(lig_pos)
-    pos_map = {}
-    pos_dist = {}
-    total_records = 0
-    failed_records = 0
-
-    for site in report.get("binding_sites", {}).values():
-        interactions = site.get("interactions", {})
-        for interaction_type, payload in interactions.items():
-            records = payload.get("records", []) if isinstance(payload, dict) else []
-            for record in records:
-                total_records += 1
-                res_chain = record.get("RESCHAIN")
-                res_num = record.get("RESNR")
-                if res_chain is None or res_num is None:
-                    failed_records += 1
-                    continue
-                res_key = (str(res_chain), int(res_num))
-                res_idx = res_key_to_idx.get(res_key)
-                if res_idx is None:
-                    failed_records += 1
-                    continue
-
-                type_id = type_to_idx.get(interaction_type)
-                if type_id is None:
-                    failed_records += 1
-                    continue
-                type_id = int(type_id) + 1
-
-                dist_value = record.get("DIST")
-                if dist_value is None:
-                    dist_value = record.get("CENTDIST")
-                dist_value = float(dist_value) if dist_value is not None else 0.0
-
-                lig_indices = None
-                if interaction_type in {"pistacking", "pication"}:
-                    lig_idx_list = record.get("LIG_IDX_LIST")
-                    if lig_idx_list:
-                        lig_indices = parse_lig_idx_list(lig_idx_list, lig_pos.shape[0])
-                        if not lig_indices:
-                            lig_indices = None
-
-                if lig_indices is None:
-                    lig_coord = record.get("LIGCOO")
-                    if lig_coord is None:
-                        failed_records += 1
-                        continue
-                    if center is not None:
-                        lig_coord = np.asarray(lig_coord, dtype=np.float32) - center
-                    thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
-                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
-                    if lig_idx is None:
-                        failed_records += 1
-                        continue
-                    lig_indices = [lig_idx]
-
-                for lig_idx in lig_indices:
-                    key = (int(lig_idx), int(res_idx))
-                    prev_dist = pos_dist.get(key)
-                    if prev_dist is None or dist_value < prev_dist:
-                        pos_map[key] = type_id
-                        pos_dist[key] = dist_value
-
-    return pos_map, pos_dist, total_records, failed_records
-
-
-def parse_lig_idx_list(lig_idx_list, num_atoms):
-    if isinstance(lig_idx_list, str):
-        tokens = [t.strip() for t in lig_idx_list.split(",") if t.strip()]
-        indices = [int(tok) for tok in tokens]
-    elif isinstance(lig_idx_list, (list, tuple, np.ndarray)):
-        indices = [int(v) for v in lig_idx_list]
-    else:
-        return []
-    if not indices:
-        return []
-    max_idx = max(indices)
-    if max_idx >= num_atoms:
-        indices = [idx - 1 for idx in indices]
-    return [idx for idx in indices if 0 <= idx < num_atoms]
-
-
-def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):
-    diff = lig_pos[:, None, :] - res_pos[None, :, :]
-    distances = np.linalg.norm(diff, axis=-1)
-    lig_idx, res_idx = np.where(distances <= cutoff)
-    return lig_idx, res_idx
-
-
-def negative_sample_edges(lig_idx, res_idx, pos_map, num_residues, neg_per_pos=20, neg_min=10, neg_max=200):
-    edge_set = {(int(l), int(r)) for l, r in zip(lig_idx, res_idx)}
-    pos_by_lig = {}
-    for (l, r) in pos_map.keys():
-        if (l, r) in edge_set:
-            pos_by_lig.setdefault(l, set()).add(r)
-
-    sampled_edges = []
-    rng = np.random.default_rng()
-    for lig_atom in np.unique(lig_idx):
-        lig_atom = int(lig_atom)
-        pos_res = pos_by_lig.get(lig_atom, set())
-        cand_res = [r for (l, r) in edge_set if l == lig_atom]
-        pos_edges = [(lig_atom, r) for r in cand_res if r in pos_res]
-        neg_pool = [r for r in cand_res if r not in pos_res]
-        num_pos = len(pos_res)
-        num_neg = min(neg_max, neg_per_pos * num_pos + neg_min)
-        if len(neg_pool) <= num_neg:
-            neg_res = neg_pool
-        else:
-            neg_res = rng.choice(neg_pool, size=num_neg, replace=False).tolist()
-        sampled_edges.extend(pos_edges + [(lig_atom, r) for r in neg_res])
-    if not sampled_edges:
-        return np.zeros((2, 0), dtype=np.int64)
-    sampled_edges = np.array(sampled_edges, dtype=np.int64)
-    return sampled_edges.T
-
-
-def build_edge_labels(edge_index, pos_map, pos_dist):
-    num_edges = edge_index.shape[1]
-    y_type = np.zeros(num_edges, dtype=np.int64)
-    y_dist = np.zeros(num_edges, dtype=np.float32)
-    for idx in range(num_edges):
-        lig_idx = int(edge_index[0, idx])
-        res_idx = int(edge_index[1, idx])
-        key = (lig_idx, res_idx)
-        if key in pos_map:
-            y_type[idx] = pos_map[key]
-            y_dist[idx] = pos_dist.get(key, 0.0)
-    return y_type, y_dist
 
 
 def preprocess_complex(
