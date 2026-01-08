@@ -35,9 +35,11 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
     res_pos = np.asarray(ca.getCoords(), dtype=np.float32)
     resnums = np.asarray(ca.getResnums())
     chains = np.asarray(ca.getChids())
-    res_keys = [(chain, int(resnum)) for chain, resnum in zip(chains, resnums)]
+    segnames = np.asarray(ca.getSegnames())
+    res_chain_ids = np.asarray([str(seg) + str(chain) for seg, chain in zip(segnames, chains)])
+    res_keys = [(chain, int(resnum)) for chain, resnum in zip(res_chain_ids, resnums)]
     res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
-    return res_pos, res_key_to_idx, res_keys
+    return res_pos, res_key_to_idx, res_keys, res_chain_ids, resnums
 
 
 def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
@@ -200,8 +202,6 @@ def preprocess_complex(
     neg_min=10,
     neg_max=200,
     bad_ratio=0.3,
-    use_training_graph=False,
-    training_graph_params=None,
 ):
     report_path = os.path.join(plip_dir, pdb_id, "report.json")
     if not os.path.exists(report_path):
@@ -210,7 +210,11 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    res_pos, res_key_to_idx, res_keys = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
+    res_pos, res_key_to_idx, res_keys, res_chain_ids, resnums = get_receptor_positions(
+        pdbbind_dir,
+        pdb_id,
+        protein_file=protein_file,
+    )
     if receptor_radius is not None:
         diff = lig_pos[:, None, :] - res_pos[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
@@ -219,6 +223,8 @@ def preprocess_complex(
             return False, f"No receptor residues within receptor_radius for {pdb_id}"
         res_pos = res_pos[keep]
         res_keys = [res_keys[i] for i in np.where(keep)[0]]
+        res_chain_ids = res_chain_ids[keep]
+        resnums = resnums[keep]
         res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
     if chain_cutoff is not None:
         diff = lig_pos[:, None, :] - res_pos[None, :, :]
@@ -228,6 +234,8 @@ def preprocess_complex(
             return False, f"No receptor residues within chain_cutoff for {pdb_id}"
         res_pos = res_pos[keep]
         res_keys = [res_keys[i] for i in np.where(keep)[0]]
+        res_chain_ids = res_chain_ids[keep]
+        resnums = resnums[keep]
         res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
 
     pos_map, pos_dist, total_records, failed_records = parse_plip_records(report, lig_pos, res_key_to_idx)
@@ -252,6 +260,8 @@ def preprocess_complex(
         {
             "lig_pos": torch.tensor(lig_pos, dtype=torch.float32),
             "res_pos": torch.tensor(res_pos, dtype=torch.float32),
+            "res_chain_ids": res_chain_ids.tolist(),
+            "resnums": resnums.astype(int).tolist(),
             "cand_edge_index": torch.tensor(edge_index, dtype=torch.long),
             "cand_edge_y_type": torch.tensor(y_type, dtype=torch.long),
             "edge_y_dist": torch.tensor(y_dist, dtype=torch.float32),
@@ -278,9 +288,6 @@ def main():
     parser.add_argument("--neg_max", type=int, default=200)
     parser.add_argument("--bad_ratio", type=float, default=0.3)
     args = parser.parse_args()
-
-    use_training_graph = args.use_training_graph or args.training_args is not None
-    training_graph_params = resolve_training_graph_params(args) if use_training_graph else None
 
     if args.split_file:
         with open(args.split_file, "r", encoding="utf-8") as f:
@@ -310,8 +317,6 @@ def main():
                 neg_min=args.neg_min,
                 neg_max=args.neg_max,
                 bad_ratio=args.bad_ratio,
-                use_training_graph=use_training_graph,
-                training_graph_params=training_graph_params,
             )
         except Exception as exc:
             ok, msg = False, f"Failed {pdb_id}: {exc}"

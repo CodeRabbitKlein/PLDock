@@ -228,20 +228,60 @@ class PDBBind(Dataset):
         nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
             return
-        if "cand_edge_index" in nci_labels:
-            edge_index = nci_labels["cand_edge_index"]
-        else:
-            edge_index = nci_labels.get("edge_index")
+        def _get_label(labels, *keys):
+            for key in keys:
+                if key in labels:
+                    value = labels[key]
+                    if value is not None:
+                        return value
+            return None
+
+        edge_index = _get_label(nci_labels, "cand_edge_index", "edge_index")
         if edge_index is None:
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
             edge_index = edge_index.t()
-        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
-        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        edge_type = _get_label(nci_labels, "cand_edge_y_type", "edge_type_y")
+        edge_dist = _get_label(nci_labels, "edge_y_dist", "edge_dist_y")
         cache_res_pos = nci_labels.get("res_pos")
+        cache_res_chain_ids = nci_labels.get("res_chain_ids")
+        cache_resnums = nci_labels.get("resnums")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
-        if cache_res_pos is not None:
+        if cache_res_chain_ids is not None and cache_resnums is not None:
+            if isinstance(cache_res_chain_ids, np.ndarray):
+                cache_res_chain_ids = cache_res_chain_ids.tolist()
+            if isinstance(cache_resnums, np.ndarray):
+                cache_resnums = cache_resnums.tolist()
+            cache_res_chain_ids = [str(chain) for chain in cache_res_chain_ids]
+            cache_resnums = [int(resnum) for resnum in cache_resnums]
+
+            curr_resnums = complex_graph['receptor'].resnums
+            curr_res_chain_ids = complex_graph['receptor'].res_chain_ids
+            if torch.is_tensor(curr_resnums):
+                curr_resnums = curr_resnums.cpu().numpy()
+            if torch.is_tensor(curr_res_chain_ids):
+                curr_res_chain_ids = curr_res_chain_ids.cpu().numpy()
+            curr_res_chain_ids = [str(chain) for chain in curr_res_chain_ids]
+            curr_resnums = [int(resnum) for resnum in curr_resnums]
+
+            current_map = {
+                (chain, resnum): idx
+                for idx, (chain, resnum) in enumerate(zip(curr_res_chain_ids, curr_resnums))
+            }
+            remap = torch.full((len(cache_resnums),), -1, dtype=torch.long)
+            for idx, (chain, resnum) in enumerate(zip(cache_res_chain_ids, cache_resnums)):
+                mapped = current_map.get((chain, resnum))
+                if mapped is not None:
+                    remap[idx] = mapped
+            remapped_rec = remap[edge_index[1]]
+            valid_edges = remapped_rec >= 0
+            edge_index = torch.stack([edge_index[0], remapped_rec], dim=0)[:, valid_edges]
+            if edge_type is not None:
+                edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+            if edge_dist is not None:
+                edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        elif cache_res_pos is not None:
             cache_res_pos = torch.as_tensor(cache_res_pos, dtype=torch.float32)
             curr_res_pos = complex_graph['receptor'].pos
             if cache_res_pos.numel() > 0 and curr_res_pos.numel() > 0:
@@ -258,6 +298,20 @@ class PDBBind(Dataset):
                     edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
                 if edge_dist is not None:
                     edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        num_lig = complex_graph['ligand'].num_nodes
+        num_rec = complex_graph['receptor'].num_nodes
+        valid_edges = (
+            (edge_index[0] >= 0)
+            & (edge_index[0] < num_lig)
+            & (edge_index[1] >= 0)
+            & (edge_index[1] < num_rec)
+        )
+        if not torch.all(valid_edges):
+            edge_index = edge_index[:, valid_edges]
+            if edge_type is not None:
+                edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+            if edge_dist is not None:
+                edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         nci_edge.edge_index = edge_index
         if edge_type is not None:
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
