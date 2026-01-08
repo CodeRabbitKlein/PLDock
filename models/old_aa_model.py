@@ -199,7 +199,7 @@ class AAOldModel(torch.nn.Module):
                     nn.Linear(ns, 1, bias=False)
                 )
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.no_aminoacid_identities:
             data['receptor'].x = data['receptor'].x * 0
 
@@ -292,6 +292,8 @@ class AAOldModel(torch.nn.Module):
                 affinity = torch.cat([AGGREGATORS[agg](affinity) for agg in self.parallel_aggregators], dim=-1)
                 affinity = self.affinity_predictor(affinity).squeeze(dim=-1)
                 confidence = confidence, affinity
+            if return_nci:
+                return confidence, None
             return confidence
         assert self.parallel == 1
 

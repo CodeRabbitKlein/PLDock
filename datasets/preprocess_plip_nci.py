@@ -4,7 +4,6 @@ import os
 
 import numpy as np
 import torch
-from rdkit import Chem
 from scipy.spatial import cKDTree
 import prody as pr
 
@@ -45,6 +44,9 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
         if dist <= threshold:
             return int(idx), float(dist)
     return None, float(dist)
+
+
+PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
 
 
 def parse_plip_records(report, lig_pos, res_key_to_idx):
@@ -89,14 +91,17 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                 if interaction_type in {"pistacking", "pication"}:
                     lig_idx_list = record.get("LIG_IDX_LIST")
                     if lig_idx_list:
-                        lig_indices = list(range(lig_pos.shape[0]))
+                        lig_indices = parse_lig_idx_list(lig_idx_list, lig_pos.shape[0])
+                        if not lig_indices:
+                            lig_indices = None
 
                 if lig_indices is None:
                     lig_coord = record.get("LIGCOO")
                     if lig_coord is None:
                         failed_records += 1
                         continue
-                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord)
+                    thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
+                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
                     if lig_idx is None:
                         failed_records += 1
                         continue
@@ -110,6 +115,22 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                         pos_dist[key] = dist_value
 
     return pos_map, pos_dist, total_records, failed_records
+
+
+def parse_lig_idx_list(lig_idx_list, num_atoms):
+    if isinstance(lig_idx_list, str):
+        tokens = [t.strip() for t in lig_idx_list.split(",") if t.strip()]
+        indices = [int(tok) for tok in tokens]
+    elif isinstance(lig_idx_list, (list, tuple, np.ndarray)):
+        indices = [int(v) for v in lig_idx_list]
+    else:
+        return []
+    if not indices:
+        return []
+    max_idx = max(indices)
+    if max_idx >= num_atoms:
+        indices = [idx - 1 for idx in indices]
+    return [idx for idx in indices if 0 <= idx < num_atoms]
 
 
 def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):
