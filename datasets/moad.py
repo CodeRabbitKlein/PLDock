@@ -304,15 +304,27 @@ class MOAD(Dataset):
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
             edge_index = edge_index.t()
-        if "cand_edge_y_type" in nci_labels:
-            edge_type = nci_labels["cand_edge_y_type"]
-        else:
-            edge_type = nci_labels.get("edge_type_y")
-        if "edge_y_dist" in nci_labels:
-            edge_dist = nci_labels["edge_y_dist"]
-        else:
-            edge_dist = nci_labels.get("edge_dist_y")
+        edge_type = nci_labels.get("cand_edge_y_type") or nci_labels.get("edge_type_y")
+        edge_dist = nci_labels.get("edge_y_dist") or nci_labels.get("edge_dist_y")
+        cache_res_pos = nci_labels.get("res_pos")
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        if cache_res_pos is not None:
+            cache_res_pos = torch.as_tensor(cache_res_pos, dtype=torch.float32)
+            curr_res_pos = complex_graph['receptor'].pos
+            if cache_res_pos.numel() > 0 and curr_res_pos.numel() > 0:
+                dist = torch.cdist(curr_res_pos, cache_res_pos)
+                min_dist, nearest = torch.min(dist, dim=1)
+                max_dist = 1.0
+                valid_nodes = min_dist <= max_dist
+                remap = torch.full((cache_res_pos.size(0),), -1, dtype=torch.long)
+                remap[nearest[valid_nodes]] = torch.nonzero(valid_nodes, as_tuple=False).view(-1)
+                remapped_rec = remap[edge_index[1]]
+                valid_edges = remapped_rec >= 0
+                edge_index = torch.stack([edge_index[0], remapped_rec], dim=0)[:, valid_edges]
+                if edge_type is not None:
+                    edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+                if edge_dist is not None:
+                    edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         nci_edge.edge_index = edge_index
         if edge_type is not None:
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)

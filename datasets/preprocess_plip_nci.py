@@ -40,88 +40,6 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
     return res_pos, res_key_to_idx, res_keys
 
 
-def load_training_args(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing training args file: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        if path.endswith(".json"):
-            data = json.load(f)
-        else:
-            data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        raise ValueError("Training args file must contain a dictionary of args.")
-    return data
-
-
-def resolve_training_graph_params(args):
-    train_args = load_training_args(args.training_args) if args.training_args else {}
-    train_defaults = {
-        "receptor_radius": 30,
-        "chain_cutoff": None,
-        "c_alpha_max_neighbors": 10,
-        "not_knn_only_graph": False,
-        "all_atoms": False,
-        "atom_radius": 5,
-        "atom_max_neighbors": 8,
-    }
-
-    def get_value(key, default):
-        value = train_args.get(key, None)
-        return default if value is None else value
-
-    if "knn_only_graph" in train_args:
-        knn_only_graph = bool(train_args["knn_only_graph"])
-    else:
-        not_knn_only_graph = train_args.get("not_knn_only_graph", train_defaults["not_knn_only_graph"])
-        knn_only_graph = not not_knn_only_graph
-
-    return {
-        "receptor_radius": get_value("receptor_radius", args.receptor_radius if args.receptor_radius is not None else train_defaults["receptor_radius"]),
-        "chain_cutoff": get_value("chain_cutoff", args.chain_cutoff),
-        "c_alpha_max_neighbors": get_value("c_alpha_max_neighbors", train_defaults["c_alpha_max_neighbors"]),
-        "knn_only_graph": knn_only_graph,
-        "all_atoms": get_value("all_atoms", train_defaults["all_atoms"]),
-        "atom_radius": get_value("atom_radius", train_defaults["atom_radius"]),
-        "atom_max_neighbors": get_value("atom_max_neighbors", train_defaults["atom_max_neighbors"]),
-    }
-
-
-def get_training_receptor_positions(pdbbind_dir, pdb_id, protein_file, training_graph_params):
-    protein_path = os.path.join(pdbbind_dir, pdb_id, f"{pdb_id}_{protein_file}.pdb")
-    if not os.path.exists(protein_path):
-        raise FileNotFoundError(f"Missing protein file: {protein_path}")
-
-    complex_graph = HeteroData()
-    moad_extract_receptor_structure(
-        path=protein_path,
-        complex_graph=complex_graph,
-        neighbor_cutoff=training_graph_params.get("receptor_radius"),
-        max_neighbors=training_graph_params.get("c_alpha_max_neighbors"),
-        knn_only_graph=training_graph_params.get("knn_only_graph", False),
-        all_atoms=training_graph_params.get("all_atoms", False),
-        atom_cutoff=training_graph_params.get("atom_radius"),
-        atom_max_neighbors=training_graph_params.get("atom_max_neighbors"),
-    )
-
-    res_pos = complex_graph["receptor"].pos.cpu().numpy()
-    res_chain_ids = getattr(complex_graph["receptor"], "res_chain_ids", None)
-    resnums = getattr(complex_graph["receptor"], "resnums", None)
-    if res_chain_ids is None or resnums is None:
-        pdb = pr.parsePDB(protein_path)
-        ca = pdb.ca
-        res_chain_ids = np.asarray(ca.getChids())
-        res_seg_ids = np.asarray(ca.getSegnames())
-        res_chain_ids = np.asarray([s + c for s, c in zip(res_seg_ids, res_chain_ids)])
-        resnums = np.asarray(ca.getResnums())
-
-    if torch.is_tensor(resnums):
-        resnums = resnums.cpu().numpy()
-    res_chain_ids = np.asarray(res_chain_ids)
-    res_keys = [(str(chain), int(resnum)) for chain, resnum in zip(res_chain_ids, resnums)]
-    res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
-    return res_pos, res_key_to_idx, res_keys
-
-
 def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
     coord = np.asarray(coord, dtype=np.float32)
     dist, idx = lig_tree.query(coord, k=1)
@@ -292,18 +210,7 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    if use_training_graph:
-        training_graph_params = training_graph_params or {}
-        res_pos, res_key_to_idx, res_keys = get_training_receptor_positions(
-            pdbbind_dir,
-            pdb_id,
-            protein_file,
-            training_graph_params,
-        )
-        receptor_radius = training_graph_params.get("receptor_radius", receptor_radius)
-        chain_cutoff = training_graph_params.get("chain_cutoff", chain_cutoff)
-    else:
-        res_pos, res_key_to_idx, res_keys = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
+    res_pos, res_key_to_idx, res_keys = get_receptor_positions(pdbbind_dir, pdb_id, protein_file=protein_file)
     if receptor_radius is not None:
         diff = lig_pos[:, None, :] - res_pos[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
@@ -365,8 +272,6 @@ def main():
     parser.add_argument("--remove_hs", action="store_true", default=False, help="Remove hydrogens from ligand")
     parser.add_argument("--receptor_radius", type=float, default=None, help="Match training receptor radius for residues")
     parser.add_argument("--chain_cutoff", type=float, default=None, help="Match training chain cutoff for receptors")
-    parser.add_argument("--use_training_graph", action="store_true", default=False, help="Build receptor graph using training settings")
-    parser.add_argument("--training_args", default=None, help="Optional training args file (train.py-style YAML/JSON)")
     parser.add_argument("--cutoff", type=float, default=10.0)
     parser.add_argument("--neg_per_pos", type=int, default=20)
     parser.add_argument("--neg_min", type=int, default=10)
