@@ -1,5 +1,6 @@
 import binascii
 import glob
+import json
 import os
 import pickle
 from collections import defaultdict
@@ -15,6 +16,7 @@ from torch_geometric.data import Dataset, HeteroData
 from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
 from rdkit.Chem import RemoveAllHs
+from scipy.spatial import cKDTree
 
 from datasets.process_mols import read_molecule, get_lig_graph_with_matching, generate_conformer, moad_extract_receptor_structure
 from utils.diffusion_utils import modify_conformer, set_time
@@ -134,7 +136,7 @@ class PDBBind(Dataset):
                  include_miscellaneous_atoms=False,
                  protein_path_list=None, ligand_descriptions=None, keep_local_structures=False,
                  protein_file="protein_processed", ligand_file="ligand",
-                 knn_only_graph=False, matching_tries=1, dataset='PDBBind', nci_cache_path=None):
+                 knn_only_graph=False, matching_tries=1, dataset='PDBBind', nci_cache_path=None, plip_dir="data/plip"):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -160,6 +162,7 @@ class PDBBind(Dataset):
         self.ligand_file = ligand_file
         self.dataset = dataset
         self.nci_cache_path = nci_cache_path
+        self.plip_dir = plip_dir
         assert knn_only_graph or (not all_atoms)
         self.all_atoms = all_atoms
         if matching or protein_path_list is not None and ligand_descriptions is not None:
@@ -317,6 +320,75 @@ class PDBBind(Dataset):
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
         if edge_dist is not None:
             nci_edge.edge_dist_y = torch.as_tensor(edge_dist, dtype=torch.float32)
+
+    def _add_nci_labels_from_plip(self, complex_graph, complex_name):
+        if self.plip_dir is None or complex_name is None:
+            return
+        report_path = os.path.join(self.plip_dir, complex_name, "report.json")
+        if not os.path.exists(report_path):
+            return
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+        except json.JSONDecodeError:
+            return
+
+        lig_pos = complex_graph['ligand'].pos
+        if not torch.is_tensor(lig_pos):
+            lig_pos = lig_pos[0]
+        res_pos = complex_graph['receptor'].pos
+        if lig_pos is None or res_pos is None:
+            return
+
+        resnums = complex_graph['receptor'].resnums
+        res_chain_ids = complex_graph['receptor'].res_chain_ids
+        if torch.is_tensor(resnums):
+            resnums = resnums.cpu().numpy()
+        if torch.is_tensor(res_chain_ids):
+            res_chain_ids = res_chain_ids.cpu().numpy()
+        res_chain_ids = [str(chain) for chain in res_chain_ids]
+        resnums = [int(resnum) for resnum in resnums]
+        res_keys = [(chain, resnum) for chain, resnum in zip(res_chain_ids, resnums)]
+        res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
+
+        center = None
+        if hasattr(complex_graph, "original_center"):
+            center = complex_graph.original_center
+            if torch.is_tensor(center):
+                center = center.detach().cpu().numpy()
+            center = np.asarray(center, dtype=np.float32).reshape(-1)
+
+        lig_pos_np = lig_pos.detach().cpu().numpy() if torch.is_tensor(lig_pos) else np.asarray(lig_pos)
+        res_pos_np = res_pos.detach().cpu().numpy() if torch.is_tensor(res_pos) else np.asarray(res_pos)
+
+        try:
+            pos_map, pos_dist, total_records, failed_records = parse_plip_records(
+                report,
+                lig_pos_np,
+                res_key_to_idx,
+                center=center,
+            )
+        except ValueError:
+            return
+        bad_ratio = 0.3
+        if total_records > 0 and failed_records / total_records > bad_ratio:
+            return
+
+        lig_idx, res_idx = build_candidate_edges(lig_pos_np, res_pos_np, cutoff=10.0)
+        edge_index = negative_sample_edges(
+            lig_idx,
+            res_idx,
+            pos_map,
+            num_residues=res_pos_np.shape[0],
+            neg_per_pos=20,
+            neg_min=10,
+            neg_max=200,
+        )
+        y_type, y_dist = build_edge_labels(edge_index, pos_map, pos_dist)
+        nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
+        nci_edge.edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+        nci_edge.edge_type_y = torch.as_tensor(y_type, dtype=torch.long)
+        nci_edge.edge_dist_y = torch.as_tensor(y_dist, dtype=torch.float32)
 
     def _load_nci_labels(self, complex_name):
         if self.nci_cache_path is None:
@@ -602,6 +674,7 @@ class PDBBind(Dataset):
 
         complex_graph.original_center = protein_center
         complex_graph['receptor_name'] = name
+        self._add_nci_labels_from_plip(complex_graph, name)
         return [complex_graph], [lig]
 
 
@@ -657,3 +730,150 @@ def read_mols(pdbbind_dir, name, remove_hs=False):
             if lig is not None:
                 ligs.append(lig)
     return ligs
+
+
+PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
+
+
+def parse_lig_idx_list(lig_idx_list, num_atoms):
+    if isinstance(lig_idx_list, str):
+        tokens = [t.strip() for t in lig_idx_list.split(",") if t.strip()]
+        indices = [int(tok) for tok in tokens]
+    elif isinstance(lig_idx_list, (list, tuple, np.ndarray)):
+        indices = [int(v) for v in lig_idx_list]
+    else:
+        return []
+    if not indices:
+        return []
+    max_idx = max(indices)
+    if max_idx >= num_atoms:
+        indices = [idx - 1 for idx in indices]
+    return [idx for idx in indices if 0 <= idx < num_atoms]
+
+
+def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
+    coord = np.asarray(coord, dtype=np.float32)
+    dist, idx = lig_tree.query(coord, k=1)
+    for threshold in thresholds:
+        if dist <= threshold:
+            return int(idx), float(dist)
+    return None, float(dist)
+
+
+def parse_plip_records(report, lig_pos, res_key_to_idx, center=None):
+    type_to_idx = report.get("type_to_idx", {})
+    if not type_to_idx:
+        raise ValueError("Missing type_to_idx in PLIP report")
+    lig_tree = cKDTree(lig_pos)
+    pos_map = {}
+    pos_dist = {}
+    total_records = 0
+    failed_records = 0
+
+    for site in report.get("binding_sites", {}).values():
+        interactions = site.get("interactions", {})
+        for interaction_type, payload in interactions.items():
+            records = payload.get("records", []) if isinstance(payload, dict) else []
+            for record in records:
+                total_records += 1
+                res_chain = record.get("RESCHAIN")
+                res_num = record.get("RESNR")
+                if res_chain is None or res_num is None:
+                    failed_records += 1
+                    continue
+                res_key = (str(res_chain), int(res_num))
+                res_idx = res_key_to_idx.get(res_key)
+                if res_idx is None:
+                    failed_records += 1
+                    continue
+
+                type_id = type_to_idx.get(interaction_type)
+                if type_id is None:
+                    failed_records += 1
+                    continue
+                type_id = int(type_id) + 1
+
+                dist_value = record.get("DIST")
+                if dist_value is None:
+                    dist_value = record.get("CENTDIST")
+                dist_value = float(dist_value) if dist_value is not None else 0.0
+
+                lig_indices = None
+                if interaction_type in {"pistacking", "pication"}:
+                    lig_idx_list = record.get("LIG_IDX_LIST")
+                    if lig_idx_list:
+                        lig_indices = parse_lig_idx_list(lig_idx_list, lig_pos.shape[0])
+                        if not lig_indices:
+                            lig_indices = None
+
+                if lig_indices is None:
+                    lig_coord = record.get("LIGCOO")
+                    if lig_coord is None:
+                        failed_records += 1
+                        continue
+                    if center is not None:
+                        lig_coord = np.asarray(lig_coord, dtype=np.float32) - center
+                    thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
+                    lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
+                    if lig_idx is None:
+                        failed_records += 1
+                        continue
+                    lig_indices = [lig_idx]
+
+                for lig_idx in lig_indices:
+                    key = (int(lig_idx), int(res_idx))
+                    prev_dist = pos_dist.get(key)
+                    if prev_dist is None or dist_value < prev_dist:
+                        pos_map[key] = type_id
+                        pos_dist[key] = dist_value
+
+    return pos_map, pos_dist, total_records, failed_records
+
+
+def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):
+    diff = lig_pos[:, None, :] - res_pos[None, :, :]
+    distances = np.linalg.norm(diff, axis=-1)
+    lig_idx, res_idx = np.where(distances <= cutoff)
+    return lig_idx, res_idx
+
+
+def negative_sample_edges(lig_idx, res_idx, pos_map, num_residues, neg_per_pos=20, neg_min=10, neg_max=200):
+    edge_set = {(int(l), int(r)) for l, r in zip(lig_idx, res_idx)}
+    pos_by_lig = {}
+    for (l, r) in pos_map.keys():
+        if (l, r) in edge_set:
+            pos_by_lig.setdefault(l, set()).add(r)
+
+    sampled_edges = []
+    rng = np.random.default_rng()
+    for lig_atom in np.unique(lig_idx):
+        lig_atom = int(lig_atom)
+        pos_res = pos_by_lig.get(lig_atom, set())
+        cand_res = [r for (l, r) in edge_set if l == lig_atom]
+        pos_edges = [(lig_atom, r) for r in cand_res if r in pos_res]
+        neg_pool = [r for r in cand_res if r not in pos_res]
+        num_pos = len(pos_res)
+        num_neg = min(neg_max, neg_per_pos * num_pos + neg_min)
+        if len(neg_pool) <= num_neg:
+            neg_res = neg_pool
+        else:
+            neg_res = rng.choice(neg_pool, size=num_neg, replace=False).tolist()
+        sampled_edges.extend(pos_edges + [(lig_atom, r) for r in neg_res])
+    if not sampled_edges:
+        return np.zeros((2, 0), dtype=np.int64)
+    sampled_edges = np.array(sampled_edges, dtype=np.int64)
+    return sampled_edges.T
+
+
+def build_edge_labels(edge_index, pos_map, pos_dist):
+    num_edges = edge_index.shape[1]
+    y_type = np.zeros(num_edges, dtype=np.int64)
+    y_dist = np.zeros(num_edges, dtype=np.float32)
+    for idx in range(num_edges):
+        lig_idx = int(edge_index[0, idx])
+        res_idx = int(edge_index[1, idx])
+        key = (lig_idx, res_idx)
+        if key in pos_map:
+            y_type[idx] = pos_map[key]
+            y_dist[idx] = pos_dist.get(key, 0.0)
+    return y_type, y_dist
