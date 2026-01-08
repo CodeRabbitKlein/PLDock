@@ -54,7 +54,7 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
 PI_LIGAND_MATCH_THRESHOLDS = (1.2, 1.6)
 
 
-def parse_plip_records(report, lig_pos, res_key_to_idx):
+def parse_plip_records(report, lig_pos, res_key_to_idx, center=None):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
         raise ValueError("Missing type_to_idx in PLIP report")
@@ -105,6 +105,8 @@ def parse_plip_records(report, lig_pos, res_key_to_idx):
                     if lig_coord is None:
                         failed_records += 1
                         continue
+                    if center is not None:
+                        lig_coord = np.asarray(lig_coord, dtype=np.float32) - center
                     thresholds = PI_LIGAND_MATCH_THRESHOLDS if interaction_type in {"pistacking", "pication"} else (0.2, 0.4)
                     lig_idx, _ = map_ligand_coord(lig_tree, lig_coord, thresholds=thresholds)
                     if lig_idx is None:
@@ -238,7 +240,16 @@ def preprocess_complex(
         resnums = resnums[keep]
         res_key_to_idx = {res_key: idx for idx, res_key in enumerate(res_keys)}
 
-    pos_map, pos_dist, total_records, failed_records = parse_plip_records(report, lig_pos, res_key_to_idx)
+    protein_center = res_pos.mean(axis=0, keepdims=False).astype(np.float32)
+    res_pos = res_pos - protein_center
+    lig_pos = lig_pos - protein_center
+
+    pos_map, pos_dist, total_records, failed_records = parse_plip_records(
+        report,
+        lig_pos,
+        res_key_to_idx,
+        center=protein_center,
+    )
     if total_records > 0 and failed_records / total_records > bad_ratio:
         return False, f"Bad sample {pdb_id}: mapping fail ratio {failed_records}/{total_records}"
 
@@ -262,6 +273,7 @@ def preprocess_complex(
             "res_pos": torch.tensor(res_pos, dtype=torch.float32),
             "res_chain_ids": res_chain_ids.tolist(),
             "resnums": resnums.astype(int).tolist(),
+            "original_center": torch.tensor(protein_center, dtype=torch.float32),
             "cand_edge_index": torch.tensor(edge_index, dtype=torch.long),
             "cand_edge_y_type": torch.tensor(y_type, dtype=torch.long),
             "edge_y_dist": torch.tensor(y_dist, dtype=torch.float32),
