@@ -263,6 +263,20 @@ class PDBBind(Dataset):
                     edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
                 if edge_dist is not None:
                     edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        num_lig = complex_graph['ligand'].num_nodes
+        num_rec = complex_graph['receptor'].num_nodes
+        valid_edges = (
+            (edge_index[0] >= 0)
+            & (edge_index[0] < num_lig)
+            & (edge_index[1] >= 0)
+            & (edge_index[1] < num_rec)
+        )
+        if not torch.all(valid_edges):
+            edge_index = edge_index[:, valid_edges]
+            if edge_type is not None:
+                edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+            if edge_dist is not None:
+                edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         nci_edge.edge_index = edge_index
         if edge_type is not None:
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
