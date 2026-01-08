@@ -268,6 +268,29 @@ class PDBBind(Dataset):
                     return {key: data[key] for key in data.files}
         return None
 
+    def _has_nci_labels(self, complex_name):
+        if self.nci_cache_path is None:
+            return False
+        candidates = []
+        if complex_name:
+            candidates.extend([complex_name, complex_name[:4], complex_name[:6]])
+        for candidate in dict.fromkeys(candidates):
+            for ext in (".pt", ".npz"):
+                path = os.path.join(self.nci_cache_path, f"{candidate}{ext}")
+                if os.path.exists(path):
+                    return True
+        return False
+
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        if getattr(self, "_nci_stats_reported", False):
+            return
+        self._nci_stats_reported = True
+        total = len(complex_names)
+        found = sum(1 for name in complex_names if self._has_nci_labels(name))
+        print(f'NCI labels available for {found}/{total} complexes in {self.nci_cache_path}')
+
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
         stats_enabled = os.environ.get("DIFFDOCK_PREPROCESS_STATS", "").lower() in {"1", "true", "yes", "on"}
