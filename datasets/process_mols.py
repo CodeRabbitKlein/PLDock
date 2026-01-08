@@ -139,6 +139,7 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
     res_chain_ids = pdb.ca.getChids()
     res_seg_ids = pdb.ca.getSegnames()
     res_chain_ids = np.asarray([s + c for s, c in zip(res_seg_ids, res_chain_ids)])
+    resnums = np.asarray(pdb.ca.getResnums())
     ids = np.unique(res_chain_ids)
     sequences = []
     lm_embeddings = lm_embeddings if sequences_to_embeddings is None else []
@@ -154,6 +155,8 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
 
     complex_graph['receptor'].sequence = sequences
     complex_graph['receptor'].chain_ids = torch.from_numpy(np.asarray(chain_ids)).long()
+    complex_graph['receptor'].resnums = torch.from_numpy(resnums).long()
+    complex_graph['receptor'].res_chain_ids = res_chain_ids
 
     new_extract_receptor_structure(seq, coords, complex_graph, neighbor_cutoff=neighbor_cutoff, max_neighbors=max_neighbors,
                                    lm_embeddings=lm_embeddings, knn_only_graph=knn_only_graph, all_atoms=all_atoms,
