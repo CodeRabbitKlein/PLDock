@@ -367,7 +367,7 @@ class AAModel(torch.nn.Module):
                atom_node_attr, data['atom', 'atom'].edge_index, atom_edge_attr, data['atom', 'atom'].edge_sh, data['atom', 'atom'].edge_weight, \
                data['atom', 'receptor'].edge_index, ar_edge_attr, data['atom', 'receptor'].edge_sh, data['atom', 'receptor'].edge_weight
 
-    def forward(self, data):
+    def forward(self, data, return_nci=False):
         if self.crop_beyond is not None:
             # TODO missing filtering atoms
             raise NotImplementedError
@@ -405,8 +405,14 @@ class AAModel(torch.nn.Module):
             lr_keys = lr_edge_index[0] * num_rec + lr_edge_index[1]
             cand_keys = cand_edge_index[0] * num_rec + cand_edge_index[1]
             lr_sorted, lr_order = torch.sort(lr_keys)
-            cand_pos = torch.searchsorted(lr_sorted, cand_keys)
-            valid = (cand_pos < lr_sorted.numel()) & (lr_sorted[cand_pos] == cand_keys)
+            if lr_sorted.numel() == 0:
+                valid = torch.zeros_like(cand_keys, dtype=torch.bool)
+                cand_pos = torch.zeros_like(cand_keys)
+            else:
+                cand_pos = torch.searchsorted(lr_sorted, cand_keys)
+                in_bounds = cand_pos < lr_sorted.numel()
+                valid = in_bounds.clone()
+                valid[in_bounds] = lr_sorted[cand_pos[in_bounds]] == cand_keys[in_bounds]
 
             rbf = torch.zeros((cand_edge_index.size(1), self.cross_distance_embed_dim), device=lig_node_attr.device)
             if valid.any():
@@ -484,6 +490,8 @@ class AAModel(torch.nn.Module):
                 affinity = torch.cat([AGGREGATORS[agg](affinity) for agg in self.parallel_aggregators], dim=-1)
                 affinity = self.affinity_predictor(affinity).squeeze(dim=-1)
                 confidence = confidence, affinity
+            if return_nci:
+                return confidence, atom_confidence, nci_logits
             return confidence, atom_confidence
         assert self.parallel == 1
 
