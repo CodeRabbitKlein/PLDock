@@ -221,10 +221,9 @@ class PDBBind(Dataset):
                 delattr(complex_graph['receptor'], a)
 
         nci_edge = None
-        try:
-            nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
-        except KeyError:
-            nci_edge = None
+        nci_edge_type = ('ligand', 'nci_cand', 'receptor')
+        if nci_edge_type in complex_graph.edge_types:
+            nci_edge = complex_graph[nci_edge_type]
         has_cached_nci = (
             nci_edge is not None
             and hasattr(nci_edge, 'edge_type_y')
@@ -235,13 +234,26 @@ class PDBBind(Dataset):
         return complex_graph
 
     def _add_nci_edges(self, complex_graph):
+        nci_edge_type = ('ligand', 'nci_cand', 'receptor')
+        def _cleanup_edge_store():
+            if nci_edge_type in complex_graph.edge_types:
+                edge_store = complex_graph[nci_edge_type]
+                edge_store.edge_index = torch.empty((2, 0), dtype=torch.long)
+                if hasattr(edge_store, 'edge_type_y'):
+                    edge_store.edge_type_y = None
+                if hasattr(edge_store, 'edge_dist_y'):
+                    edge_store.edge_dist_y = None
+
         if self.nci_cache_path is None:
+            _cleanup_edge_store()
             return
         complex_name = complex_graph['name'] if 'name' in complex_graph else None
         if complex_name is None:
+            _cleanup_edge_store()
             return
         nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
+            _cleanup_edge_store()
             return
         def _get_label(labels, *keys):
             for key in keys:
@@ -253,6 +265,7 @@ class PDBBind(Dataset):
 
         edge_index = _get_label(nci_labels, "cand_edge_index", "edge_index")
         if edge_index is None:
+            _cleanup_edge_store()
             return
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
@@ -262,7 +275,6 @@ class PDBBind(Dataset):
         cache_res_pos = nci_labels.get("res_pos")
         cache_res_chain_ids = nci_labels.get("res_chain_ids")
         cache_resnums = nci_labels.get("resnums")
-        nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         num_rec = complex_graph['receptor'].num_nodes
         min_cache_ratio = 0.6
         min_hit_ratio = 0.6
@@ -284,6 +296,7 @@ class PDBBind(Dataset):
             cache_resnums = [int(resnum) for resnum in cache_resnums]
             if len(cache_resnums) == 0 or num_rec == 0:
                 _warn_skip("empty cache or receptor nodes")
+                _cleanup_edge_store()
                 return
             size_ratio = min(len(cache_resnums), num_rec) / max(len(cache_resnums), num_rec)
             if size_ratio < min_cache_ratio:
@@ -294,6 +307,7 @@ class PDBBind(Dataset):
                         ratio=size_ratio,
                     )
                 )
+                _cleanup_edge_store()
                 return
 
             curr_resnums = complex_graph['receptor'].resnums
@@ -331,6 +345,7 @@ class PDBBind(Dataset):
                         total_rec=num_rec,
                     )
                 )
+                _cleanup_edge_store()
                 return
             remapped_rec = remap[edge_index[1]]
             valid_edges = remapped_rec >= 0
@@ -369,6 +384,7 @@ class PDBBind(Dataset):
                 edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
             if edge_dist is not None:
                 edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        nci_edge = complex_graph[nci_edge_type]
         nci_edge.edge_index = edge_index
         if edge_type is not None:
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
