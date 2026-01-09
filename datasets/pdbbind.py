@@ -447,12 +447,14 @@ class PDBBind(Dataset):
 
         lig_pos_np = lig_pos.detach().cpu().numpy() if torch.is_tensor(lig_pos) else np.asarray(lig_pos)
         res_pos_np = res_pos.detach().cpu().numpy() if torch.is_tensor(res_pos) else np.asarray(res_pos)
-        res_id_map = None
+        res_key_to_full_idx = None
+        res_keys_full = None
         res_keys = getattr(complex_graph['receptor'], "res_keys", None)
         if res_keys is not None:
             if torch.is_tensor(res_keys):
                 res_keys = res_keys.cpu().numpy().tolist()
-            res_id_map = {tuple(res_key): idx for idx, res_key in enumerate(res_keys)}
+            res_keys_full = res_keys
+            res_key_to_full_idx = {tuple(res_key): idx for idx, res_key in enumerate(res_keys_full)}
         else:
             res_chain_ids = getattr(complex_graph['receptor'], "res_chain_ids", None)
             resnums = getattr(complex_graph['receptor'], "resnums", None)
@@ -463,7 +465,11 @@ class PDBBind(Dataset):
                     resnums = resnums.cpu().numpy()
                 res_chain_ids = [str(chain) for chain in res_chain_ids]
                 resnums = [int(resnum) for resnum in resnums]
-                res_id_map = {
+                res_keys_full = [
+                    (chain, resnum, "", "")
+                    for chain, resnum in zip(res_chain_ids, resnums)
+                ]
+                res_key_to_full_idx = {
                     (chain, resnum, "", ""): idx
                     for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
                 }
@@ -482,7 +488,8 @@ class PDBBind(Dataset):
                 lig_pos_np,
                 res_pos_np,
                 center=center,
-                res_id_map=res_id_map,
+                res_keys_full=res_keys_full,
+                res_key_to_full_idx=res_key_to_full_idx,
             )
         except ValueError:
             return
@@ -914,7 +921,15 @@ def _plip_res_key(record):
     return (res_chain_value, res_nr_value, res_icode, res_name_value), (res_chain_value, res_nr_value), res_icode_raw
 
 
-def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, use_res_id=True):
+def parse_plip_records(
+    report,
+    lig_pos,
+    res_pos,
+    center=None,
+    res_keys_full=None,
+    res_key_to_full_idx=None,
+    use_res_id=True,
+):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
         raise ValueError("Missing type_to_idx in PLIP report")
@@ -928,10 +943,14 @@ def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, u
     missing_icode_records = 0
     fallback_records = 0
     fallback_map = None
-    if res_id_map:
+    if res_key_to_full_idx:
         fallback_map = {}
-        for key, idx in res_id_map.items():
+        source_keys = res_keys_full if res_keys_full is not None else res_key_to_full_idx.keys()
+        for key in source_keys:
             if isinstance(key, tuple) and len(key) >= 2:
+                idx = res_key_to_full_idx.get(tuple(key))
+                if idx is None:
+                    continue
                 chain = str(key[0])
                 resnr = key[1]
                 resname = str(key[3]) if len(key) > 3 else ""
@@ -945,11 +964,14 @@ def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, u
                 total_records += 1
                 res_idx = None
                 res_key, fallback_key, raw_icode = _plip_res_key(record)
-                if use_res_id and res_id_map is not None and res_key is not None:
+                if use_res_id and res_key_to_full_idx is not None:
+                    if res_key is None:
+                        filtered_records += 1
+                        continue
                     missing_icode = _normalize_plip_icode(raw_icode) == ""
                     if missing_icode:
                         missing_icode_records += 1
-                    res_idx = res_id_map.get(res_key)
+                    res_idx = res_key_to_full_idx.get(res_key)
                     if res_idx is None and missing_icode and fallback_map is not None and fallback_key is not None:
                         candidates = fallback_map.get(fallback_key, [])
                         if res_key[3]:

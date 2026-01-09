@@ -15,6 +15,7 @@ from datasets.pdbbind import (
     build_edge_labels,
 )
 from datasets.process_mols import moad_extract_receptor_structure
+from utils.utils import remap_edge_index
 
 
 def get_ligand_positions(pdbbind_dir, pdb_id, ligand_file="ligand", remove_hs=False):
@@ -78,37 +79,35 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    res_pos, res_chain_ids, resnums, res_keys = get_receptor_positions(
+    res_pos_full, res_chain_ids_full, resnums_full, res_keys_full = get_receptor_positions(
         pdbbind_dir,
         pdb_id,
         protein_file=protein_file,
     )
+    keep = np.ones(len(res_pos_full), dtype=bool)
     if receptor_radius is not None:
-        diff = lig_pos[:, None, :] - res_pos[None, :, :]
+        diff = lig_pos[:, None, :] - res_pos_full[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
-        keep = min_dist < receptor_radius
+        keep &= min_dist < receptor_radius
         if not np.any(keep):
             return False, f"No receptor residues within receptor_radius for {pdb_id}"
-        res_pos = res_pos[keep]
-        res_chain_ids = res_chain_ids[keep]
-        resnums = resnums[keep]
-        res_keys = [res_keys[idx] for idx, flag in enumerate(keep) if flag]
     if chain_cutoff is not None:
-        diff = lig_pos[:, None, :] - res_pos[None, :, :]
+        diff = lig_pos[:, None, :] - res_pos_full[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
-        keep = min_dist < chain_cutoff
+        keep &= min_dist < chain_cutoff
         if not np.any(keep):
             return False, f"No receptor residues within chain_cutoff for {pdb_id}"
-        res_pos = res_pos[keep]
-        res_chain_ids = res_chain_ids[keep]
-        resnums = resnums[keep]
-        res_keys = [res_keys[idx] for idx, flag in enumerate(keep) if flag]
+    res_pos = res_pos_full[keep]
+    res_chain_ids = res_chain_ids_full[keep]
+    resnums = resnums_full[keep]
+    res_keys = [res_keys_full[idx] for idx, flag in enumerate(keep) if flag]
 
     protein_center = res_pos.mean(axis=0, keepdims=False).astype(np.float32)
     res_pos = res_pos - protein_center
+    res_pos_full = res_pos_full - protein_center
     lig_pos = lig_pos - protein_center
 
-    res_id_map = {tuple(res_key): idx for idx, res_key in enumerate(res_keys)}
+    res_key_to_full_idx = {tuple(res_key): idx for idx, res_key in enumerate(res_keys_full)}
     (
         pos_map,
         pos_dist,
@@ -120,25 +119,35 @@ def preprocess_complex(
     ) = parse_plip_records(
         report,
         lig_pos,
-        res_pos,
+        res_pos_full,
         center=protein_center,
-        res_id_map=res_id_map,
+        res_keys_full=res_keys_full,
+        res_key_to_full_idx=res_key_to_full_idx,
     )
     failed_total = failed_records + filtered_records
     if total_records > 0 and failed_total / total_records > bad_ratio:
         return False, f"Bad sample {pdb_id}: mapping fail ratio {failed_total}/{total_records}"
 
-    lig_idx, res_idx = build_candidate_edges(lig_pos, res_pos, cutoff=cutoff)
+    lig_idx, res_idx = build_candidate_edges(lig_pos, res_pos_full, cutoff=cutoff)
     edge_index = negative_sample_edges(
         lig_idx,
         res_idx,
         pos_map,
-        num_residues=res_pos.shape[0],
+        num_residues=res_pos_full.shape[0],
         neg_per_pos=neg_per_pos,
         neg_min=neg_min,
         neg_max=neg_max,
     )
     y_type, y_dist = build_edge_labels(edge_index, pos_map, pos_dist)
+    if not np.all(keep):
+        old_to_new = torch.full((len(keep),), -1, dtype=torch.long)
+        if keep.any():
+            old_to_new[torch.from_numpy(keep)] = torch.arange(int(keep.sum()))
+        edge_index, valid_edges = remap_edge_index(torch.as_tensor(edge_index, dtype=torch.long), old_to_new)
+        edge_index = edge_index.cpu().numpy()
+        if valid_edges is not None:
+            y_type = y_type[valid_edges.cpu().numpy()]
+            y_dist = y_dist[valid_edges.cpu().numpy()]
 
     os.makedirs(cache_dir, exist_ok=True)
     out_path = os.path.join(cache_dir, f"{pdb_id}.pt")
@@ -149,7 +158,7 @@ def preprocess_complex(
             "res_chain_ids": res_chain_ids.tolist(),
             "resnums": resnums.astype(int).tolist(),
             "res_keys": res_keys,
-            "res_id_map": res_id_map,
+            "res_id_map": res_key_to_full_idx,
             "plip_total_records": int(total_records),
             "plip_failed_records": int(failed_records),
             "plip_filtered_records": int(filtered_records),
