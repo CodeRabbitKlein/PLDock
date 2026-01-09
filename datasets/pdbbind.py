@@ -222,13 +222,25 @@ class PDBBind(Dataset):
 
         nci_edge = None
         nci_edge_type = ('ligand', 'nci_cand', 'receptor')
+        has_cached_nci = False
         if nci_edge_type in complex_graph.edge_types:
             nci_edge = complex_graph[nci_edge_type]
-        has_cached_nci = (
-            nci_edge is not None
-            and hasattr(nci_edge, 'edge_type_y')
-            and nci_edge.edge_type_y is not None
-        )
+            has_cached_nci = (
+                hasattr(nci_edge, 'edge_type_y')
+                and nci_edge.edge_type_y is not None
+            )
+            if has_cached_nci and hasattr(nci_edge, 'edge_index'):
+                edge_index = nci_edge.edge_index
+                num_lig = complex_graph['ligand'].num_nodes
+                num_rec = complex_graph['receptor'].num_nodes
+                bad_lig = (edge_index[0] < 0) | (edge_index[0] >= num_lig)
+                bad_rec = (edge_index[1] < 0) | (edge_index[1] >= num_rec)
+                if bad_lig.any() or bad_rec.any():
+                    nci_edge.edge_index = torch.empty((2, 0), dtype=torch.long)
+                    nci_edge.edge_type_y = None
+                    if hasattr(nci_edge, 'edge_dist_y'):
+                        nci_edge.edge_dist_y = None
+                    has_cached_nci = False
         if not has_cached_nci:
             self._add_nci_edges(complex_graph)
         return complex_graph
