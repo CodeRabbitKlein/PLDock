@@ -128,7 +128,8 @@ def safe_index(l, e):
 
 
 def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max_neighbors=None, sequences_to_embeddings=None,
-                                    knn_only_graph=False, lm_embeddings=None, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None):
+                                    knn_only_graph=False, lm_embeddings=None, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None,
+                                    build_full_receptor=False, max_full_residues=None):
     # load the entire pdb file
     pdb = pr.parsePDB(path)
     seq = pdb.ca.getSequence()
@@ -158,43 +159,55 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
     complex_graph['receptor'].resnums = torch.from_numpy(resnums).long()
     complex_graph['receptor'].res_chain_ids = res_chain_ids
 
+    use_full_receptor = build_full_receptor and (max_full_residues is None or len(seq) <= max_full_residues)
     new_extract_receptor_structure(seq, coords, complex_graph, neighbor_cutoff=neighbor_cutoff, max_neighbors=max_neighbors,
                                    lm_embeddings=lm_embeddings, knn_only_graph=knn_only_graph, all_atoms=all_atoms,
-                                   atom_cutoff=atom_cutoff, atom_max_neighbors=atom_max_neighbors)
+                                   atom_cutoff=atom_cutoff, atom_max_neighbors=atom_max_neighbors,
+                                   build_full_receptor=use_full_receptor, max_full_residues=max_full_residues)
 
 
 def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cutoff=20, max_neighbors=None, lm_embeddings=None,
-                                   knn_only_graph=False, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None):
+                                   knn_only_graph=False, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None,
+                                   build_full_receptor=False, max_full_residues=None):
     chi_angles, one_hot = get_chi_angles(all_coords, seq, return_onehot=True)
     n_rel_pos, c_rel_pos = all_coords[:, 0, :] - all_coords[:, 1, :], all_coords[:, 2, :] - all_coords[:, 1, :]
     side_chain_vecs = torch.from_numpy(np.concatenate([chi_angles / 360, n_rel_pos, c_rel_pos], axis=1))
 
+    use_full_receptor = build_full_receptor and (max_full_residues is None or len(seq) <= max_full_residues)
     # Build the k-NN graph
     coords = torch.tensor(all_coords[:, 1, :], dtype=torch.float)
     if len(coords) > 3000:
         raise ValueError(f'The receptor is too large {len(coords)}')
-    if knn_only_graph:
-        edge_index = knn_graph(coords, k=max_neighbors if max_neighbors else 32)
+    if use_full_receptor:
+        if len(coords) > 1:
+            src_list = np.concatenate([np.arange(len(coords) - 1), np.arange(1, len(coords))])
+            dst_list = np.concatenate([np.arange(1, len(coords)), np.arange(len(coords) - 1)])
+            edge_index = torch.from_numpy(np.asarray([dst_list, src_list]))
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
     else:
-        distances = cdist(coords, coords)
-        src_list = []
-        dst_list = []
-        for i in range(len(coords)):
-            dst = list(np.where(distances[i, :] < neighbor_cutoff)[0])
-            dst.remove(i)
-            max_neighbors = max_neighbors if max_neighbors else 1000
-            if max_neighbors != None and len(dst) > max_neighbors:
-                dst = list(np.argsort(distances[i, :]))[1: max_neighbors + 1]
-            if len(dst) == 0:
-                dst = list(np.argsort(distances[i, :]))[1:2]  # choose second because first is i itself
-                print(
-                    f'The cutoff {neighbor_cutoff} was too small for one atom such that it had no neighbors. '
-                    f'So we connected it to the closest other atom')
-            assert i not in dst
-            src = [i] * len(dst)
-            src_list.extend(src)
-            dst_list.extend(dst)
-        edge_index = torch.from_numpy(np.asarray([dst_list, src_list]))
+        if knn_only_graph:
+            edge_index = knn_graph(coords, k=max_neighbors if max_neighbors else 32)
+        else:
+            distances = cdist(coords, coords)
+            src_list = []
+            dst_list = []
+            for i in range(len(coords)):
+                dst = list(np.where(distances[i, :] < neighbor_cutoff)[0])
+                dst.remove(i)
+                max_neighbors = max_neighbors if max_neighbors else 1000
+                if max_neighbors != None and len(dst) > max_neighbors:
+                    dst = list(np.argsort(distances[i, :]))[1: max_neighbors + 1]
+                if len(dst) == 0:
+                    dst = list(np.argsort(distances[i, :]))[1:2]  # choose second because first is i itself
+                    print(
+                        f'The cutoff {neighbor_cutoff} was too small for one atom such that it had no neighbors. '
+                        f'So we connected it to the closest other atom')
+                assert i not in dst
+                src = [i] * len(dst)
+                src_list.extend(src)
+                dst_list.extend(dst)
+            edge_index = torch.from_numpy(np.asarray([dst_list, src_list]))
 
     res_names_list = [aa_short2long[seq[i]] if seq[i] in aa_short2long else 'misc' for i in range(len(seq))]
     feature_list = [[safe_index(allowable_features['possible_amino_acids'], res)] for res in res_names_list]
