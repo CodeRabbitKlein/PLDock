@@ -436,21 +436,36 @@ class PDBBind(Dataset):
         lig_pos_np = lig_pos.detach().cpu().numpy() if torch.is_tensor(lig_pos) else np.asarray(lig_pos)
         res_pos_np = res_pos.detach().cpu().numpy() if torch.is_tensor(res_pos) else np.asarray(res_pos)
         res_id_map = None
-        res_chain_ids = getattr(complex_graph['receptor'], "res_chain_ids", None)
-        resnums = getattr(complex_graph['receptor'], "resnums", None)
-        if res_chain_ids is not None and resnums is not None:
-            if torch.is_tensor(res_chain_ids):
-                res_chain_ids = res_chain_ids.cpu().numpy()
-            if torch.is_tensor(resnums):
-                resnums = resnums.cpu().numpy()
-            res_chain_ids = [str(chain) for chain in res_chain_ids]
-            resnums = [int(resnum) for resnum in resnums]
-            res_id_map = {
-                (chain, resnum): idx for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
-            }
+        res_keys = getattr(complex_graph['receptor'], "res_keys", None)
+        if res_keys is not None:
+            if torch.is_tensor(res_keys):
+                res_keys = res_keys.cpu().numpy().tolist()
+            res_id_map = {tuple(res_key): idx for idx, res_key in enumerate(res_keys)}
+        else:
+            res_chain_ids = getattr(complex_graph['receptor'], "res_chain_ids", None)
+            resnums = getattr(complex_graph['receptor'], "resnums", None)
+            if res_chain_ids is not None and resnums is not None:
+                if torch.is_tensor(res_chain_ids):
+                    res_chain_ids = res_chain_ids.cpu().numpy()
+                if torch.is_tensor(resnums):
+                    resnums = resnums.cpu().numpy()
+                res_chain_ids = [str(chain) for chain in res_chain_ids]
+                resnums = [int(resnum) for resnum in resnums]
+                res_id_map = {
+                    (chain, resnum, "", ""): idx
+                    for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
+                }
 
         try:
-            pos_map, pos_dist, total_records, failed_records, filtered_records = parse_plip_records(
+            (
+                pos_map,
+                pos_dist,
+                total_records,
+                failed_records,
+                filtered_records,
+                _missing_icode_records,
+                _fallback_records,
+            ) = parse_plip_records(
                 report,
                 lig_pos_np,
                 res_pos_np,
@@ -852,6 +867,32 @@ def map_ligand_coord(lig_tree, coord, thresholds=(0.2, 0.4)):
     return None, float(dist)
 
 
+def _normalize_plip_icode(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    return value if value else ""
+
+
+def _plip_res_key(record):
+    res_chain = record.get("RESCHAIN")
+    res_nr = record.get("RESNR")
+    res_name = record.get("RESNAME")
+    res_icode_raw = record.get("RESICODE")
+    if res_icode_raw is None:
+        res_icode_raw = record.get("ICODE")
+    res_icode = _normalize_plip_icode(res_icode_raw)
+    if res_chain is None or res_nr is None:
+        return None, None, res_icode_raw
+    try:
+        res_nr_value = int(res_nr)
+    except (TypeError, ValueError):
+        res_nr_value = res_nr
+    res_chain_value = str(res_chain)
+    res_name_value = str(res_name) if res_name is not None else ""
+    return (res_chain_value, res_nr_value, res_icode, res_name_value), (res_chain_value, res_nr_value), res_icode_raw
+
+
 def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, use_res_id=True):
     type_to_idx = report.get("type_to_idx", {})
     if not type_to_idx:
@@ -863,6 +904,17 @@ def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, u
     total_records = 0
     failed_records = 0
     filtered_records = 0
+    missing_icode_records = 0
+    fallback_records = 0
+    fallback_map = None
+    if res_id_map:
+        fallback_map = {}
+        for key, idx in res_id_map.items():
+            if isinstance(key, tuple) and len(key) >= 2:
+                chain = str(key[0])
+                resnr = key[1]
+                resname = str(key[3]) if len(key) > 3 else ""
+                fallback_map.setdefault((chain, resnr), []).append((idx, resname))
 
     for site in report.get("binding_sites", {}).values():
         interactions = site.get("interactions", {})
@@ -871,14 +923,19 @@ def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, u
             for record in records:
                 total_records += 1
                 res_idx = None
-                res_chain = record.get("RESCHAIN")
-                res_nr = record.get("RESNR")
-                if use_res_id and res_id_map is not None and res_chain is not None and res_nr is not None:
-                    try:
-                        res_key = (str(res_chain), int(res_nr))
-                    except (TypeError, ValueError):
-                        res_key = (str(res_chain), res_nr)
+                res_key, fallback_key, raw_icode = _plip_res_key(record)
+                if use_res_id and res_id_map is not None and res_key is not None:
+                    missing_icode = _normalize_plip_icode(raw_icode) == ""
+                    if missing_icode:
+                        missing_icode_records += 1
                     res_idx = res_id_map.get(res_key)
+                    if res_idx is None and missing_icode and fallback_map is not None and fallback_key is not None:
+                        candidates = fallback_map.get(fallback_key, [])
+                        if res_key[3]:
+                            candidates = [c for c in candidates if c[1] == res_key[3]]
+                        if len(candidates) == 1:
+                            res_idx = candidates[0][0]
+                            fallback_records += 1
                     if res_idx is None:
                         filtered_records += 1
                         continue
@@ -932,7 +989,15 @@ def parse_plip_records(report, lig_pos, res_pos, center=None, res_id_map=None, u
                         pos_map[key] = type_id
                         pos_dist[key] = dist_value
 
-    return pos_map, pos_dist, total_records, failed_records, filtered_records
+    return (
+        pos_map,
+        pos_dist,
+        total_records,
+        failed_records,
+        filtered_records,
+        missing_icode_records,
+        fallback_records,
+    )
 
 
 def build_candidate_edges(lig_pos, res_pos, cutoff=10.0):
