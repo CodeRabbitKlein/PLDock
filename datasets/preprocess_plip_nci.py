@@ -38,10 +38,21 @@ def get_receptor_positions(pdbbind_dir, pdb_id, protein_file="protein_processed"
         raise ValueError(f"No CA atoms found for {pdb_id}")
     res_pos = np.asarray(ca.getCoords(), dtype=np.float32)
     resnums = np.asarray(ca.getResnums())
+    resnames = np.asarray(ca.getResnames())
+    icodes = ca.getIcodes()
+    if icodes is None:
+        icodes = np.asarray([""] * len(resnums))
+    else:
+        icodes = np.asarray([icode if icode is not None else "" for icode in icodes])
+    icodes = np.asarray([str(icode).strip() if str(icode).strip() else "" for icode in icodes])
     chains = np.asarray(ca.getChids())
     segnames = np.asarray(ca.getSegnames())
     res_chain_ids = np.asarray([str(seg) + str(chain) for seg, chain in zip(segnames, chains)])
-    return res_pos, res_chain_ids, resnums
+    res_keys = [
+        (str(chain), int(resnum), str(icode), str(resname))
+        for chain, resnum, icode, resname in zip(res_chain_ids, resnums, icodes, resnames)
+    ]
+    return res_pos, res_chain_ids, resnums, res_keys
 
 
 def preprocess_complex(
@@ -67,7 +78,7 @@ def preprocess_complex(
         report = json.load(f)
 
     lig_pos = get_ligand_positions(pdbbind_dir, pdb_id, ligand_file=ligand_file, remove_hs=remove_hs)
-    res_pos, res_chain_ids, resnums = get_receptor_positions(
+    res_pos, res_chain_ids, resnums, res_keys = get_receptor_positions(
         pdbbind_dir,
         pdb_id,
         protein_file=protein_file,
@@ -81,6 +92,7 @@ def preprocess_complex(
         res_pos = res_pos[keep]
         res_chain_ids = res_chain_ids[keep]
         resnums = resnums[keep]
+        res_keys = [res_keys[idx] for idx, flag in enumerate(keep) if flag]
     if chain_cutoff is not None:
         diff = lig_pos[:, None, :] - res_pos[None, :, :]
         min_dist = np.linalg.norm(diff, axis=-1).min(axis=0)
@@ -90,15 +102,22 @@ def preprocess_complex(
         res_pos = res_pos[keep]
         res_chain_ids = res_chain_ids[keep]
         resnums = resnums[keep]
+        res_keys = [res_keys[idx] for idx, flag in enumerate(keep) if flag]
 
     protein_center = res_pos.mean(axis=0, keepdims=False).astype(np.float32)
     res_pos = res_pos - protein_center
     lig_pos = lig_pos - protein_center
 
-    res_id_map = {
-        (str(chain), int(resnum)): idx for idx, (chain, resnum) in enumerate(zip(res_chain_ids, resnums))
-    }
-    pos_map, pos_dist, total_records, failed_records, filtered_records = parse_plip_records(
+    res_id_map = {tuple(res_key): idx for idx, res_key in enumerate(res_keys)}
+    (
+        pos_map,
+        pos_dist,
+        total_records,
+        failed_records,
+        filtered_records,
+        missing_icode_records,
+        fallback_records,
+    ) = parse_plip_records(
         report,
         lig_pos,
         res_pos,
@@ -129,10 +148,13 @@ def preprocess_complex(
             "res_pos": torch.tensor(res_pos, dtype=torch.float32),
             "res_chain_ids": res_chain_ids.tolist(),
             "resnums": resnums.astype(int).tolist(),
+            "res_keys": res_keys,
             "res_id_map": res_id_map,
             "plip_total_records": int(total_records),
             "plip_failed_records": int(failed_records),
             "plip_filtered_records": int(filtered_records),
+            "plip_missing_icode_records": int(missing_icode_records),
+            "plip_fallback_records": int(fallback_records),
             "original_center": torch.tensor(protein_center, dtype=torch.float32),
             "cand_edge_index": torch.tensor(edge_index, dtype=torch.long),
             "cand_edge_y_type": torch.tensor(y_type, dtype=torch.long),

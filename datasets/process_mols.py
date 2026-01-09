@@ -141,6 +141,13 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
     res_seg_ids = pdb.ca.getSegnames()
     res_chain_ids = np.asarray([s + c for s, c in zip(res_seg_ids, res_chain_ids)])
     resnums = np.asarray(pdb.ca.getResnums())
+    resnames = np.asarray(pdb.ca.getResnames())
+    icodes = pdb.ca.getIcodes()
+    if icodes is None:
+        icodes = np.asarray([""] * len(resnums))
+    else:
+        icodes = np.asarray([icode if icode is not None else "" for icode in icodes])
+    icodes = np.asarray([str(icode).strip() if str(icode).strip() else "" for icode in icodes])
     ids = np.unique(res_chain_ids)
     sequences = []
     lm_embeddings = lm_embeddings if sequences_to_embeddings is None else []
@@ -158,6 +165,10 @@ def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max
     complex_graph['receptor'].chain_ids = torch.from_numpy(np.asarray(chain_ids)).long()
     complex_graph['receptor'].resnums = torch.from_numpy(resnums).long()
     complex_graph['receptor'].res_chain_ids = res_chain_ids
+    complex_graph['receptor'].res_keys = [
+        (str(chain), int(resnum), str(icode), str(resname))
+        for chain, resnum, icode, resname in zip(res_chain_ids, resnums, icodes, resnames)
+    ]
 
     use_full_receptor = build_full_receptor and (max_full_residues is None or len(seq) <= max_full_residues)
     new_extract_receptor_structure(seq, coords, complex_graph, neighbor_cutoff=neighbor_cutoff, max_neighbors=max_neighbors,
