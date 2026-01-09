@@ -137,7 +137,8 @@ class PDBBind(Dataset):
                  include_miscellaneous_atoms=False,
                  protein_path_list=None, ligand_descriptions=None, keep_local_structures=False,
                  protein_file="protein_processed", ligand_file="ligand",
-                 knn_only_graph=False, matching_tries=1, dataset='PDBBind', nci_cache_path=None, plip_dir="data/plip"):
+                 knn_only_graph=False, matching_tries=1, dataset='PDBBind', nci_cache_path=None, plip_dir="data/plip",
+                 build_full_receptor=False, max_full_residues=None):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -164,6 +165,8 @@ class PDBBind(Dataset):
         self.dataset = dataset
         self.nci_cache_path = nci_cache_path
         self.plip_dir = plip_dir
+        self.build_full_receptor = build_full_receptor
+        self.max_full_residues = max_full_residues
         assert knn_only_graph or (not all_atoms)
         self.all_atoms = all_atoms
         if matching or protein_path_list is not None and ligand_descriptions is not None:
@@ -187,7 +190,8 @@ class PDBBind(Dataset):
                                             + ('' if not self.fixed_knn_radius_graph else (f'_fixedKNN' if not self.knn_only_graph else '_fixedKNNonly'))
                                             + ('' if not self.include_miscellaneous_atoms else '_miscAtoms')
                                             + ('' if self.use_old_wrong_embedding_order else '_chainOrd')
-                                            + ('' if self.matching_tries == 1 else f'_tries{matching_tries}'))
+                                            + ('' if self.matching_tries == 1 else f'_tries{matching_tries}')
+                                            + ('' if not self.build_full_receptor else f'_fullRec{self.max_full_residues if self.max_full_residues is not None else "all"}'))
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
@@ -727,7 +731,9 @@ class PDBBind(Dataset):
                                             knn_only_graph=self.knn_only_graph,
                                             all_atoms=self.all_atoms,
                                             atom_cutoff=self.atom_radius,
-                                            atom_max_neighbors=self.atom_max_neighbors)
+                                            atom_max_neighbors=self.atom_max_neighbors,
+                                            build_full_receptor=self.build_full_receptor,
+                                            max_full_residues=self.max_full_residues)
 
         except Exception as e:
             print(f'Skipping {name} because of the error:')
