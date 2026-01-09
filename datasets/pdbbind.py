@@ -21,7 +21,7 @@ from scipy.spatial import cKDTree
 
 from datasets.process_mols import read_molecule, get_lig_graph_with_matching, generate_conformer, moad_extract_receptor_structure
 from utils.diffusion_utils import modify_conformer, set_time
-from utils.utils import read_strings_from_txt, crop_beyond
+from utils.utils import read_strings_from_txt, crop_beyond, remap_edge_index
 from utils import so3, torus
 
  
@@ -126,6 +126,8 @@ class NoiseTransform(BaseTransform):
         if self.crop_beyond_cutoff is not None:
             crop_beyond(data, tr_sigma * 3 + self.crop_beyond_cutoff, self.all_atom)
         set_time(data, t, t_tr, t_rot, t_tor, 1, self.all_atom, device=None, include_miscellaneous_atoms=self.include_miscellaneous_atoms)
+        if hasattr(data['receptor'], "old_to_new"):
+            delattr(data['receptor'], "old_to_new")
         return data
 
 
@@ -387,6 +389,14 @@ class PDBBind(Dataset):
                     edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
                 if edge_dist is not None:
                     edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        old_to_new = getattr(complex_graph['receptor'], "old_to_new", None)
+        if old_to_new is not None:
+            edge_index, valid_edges = remap_edge_index(edge_index, old_to_new)
+            if valid_edges is not None:
+                if edge_type is not None:
+                    edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+                if edge_dist is not None:
+                    edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         num_lig = complex_graph['ligand'].num_nodes
         valid_edges = (
             (edge_index[0] >= 0)
@@ -406,6 +416,8 @@ class PDBBind(Dataset):
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
         if edge_dist is not None:
             nci_edge.edge_dist_y = torch.as_tensor(edge_dist, dtype=torch.float32)
+        if hasattr(complex_graph['receptor'], "old_to_new"):
+            delattr(complex_graph['receptor'], "old_to_new")
 
     def _add_nci_labels_from_plip(self, complex_graph, complex_name):
         if self.plip_dir is None or complex_name is None:
@@ -490,10 +502,19 @@ class PDBBind(Dataset):
             neg_max=200,
         )
         y_type, y_dist = build_edge_labels(edge_index, pos_map, pos_dist)
+        old_to_new = getattr(complex_graph['receptor'], "old_to_new", None)
+        if old_to_new is not None:
+            edge_index, valid_edges = remap_edge_index(torch.as_tensor(edge_index, dtype=torch.long), old_to_new)
+            edge_index = edge_index.cpu().numpy()
+            if valid_edges is not None:
+                y_type = y_type[valid_edges.cpu().numpy()]
+                y_dist = y_dist[valid_edges.cpu().numpy()]
         nci_edge = complex_graph['ligand', 'nci_cand', 'receptor']
         nci_edge.edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         nci_edge.edge_type_y = torch.as_tensor(y_type, dtype=torch.long)
         nci_edge.edge_dist_y = torch.as_tensor(y_dist, dtype=torch.float32)
+        if hasattr(complex_graph['receptor'], "old_to_new"):
+            delattr(complex_graph['receptor'], "old_to_new")
 
     def _load_nci_labels(self, complex_name):
         if self.nci_cache_path is None:

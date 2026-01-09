@@ -389,13 +389,16 @@ def crop_beyond(complex_graph, cutoff, all_atoms):
     ligand_pos = complex_graph['ligand'].pos
     receptor_pos = complex_graph['receptor'].pos
     residues_to_keep = torch.any(torch.sum((ligand_pos.unsqueeze(0) - receptor_pos.unsqueeze(1)) ** 2, -1) < cutoff ** 2, dim=1)
+    old_to_new = torch.full((residues_to_keep.size(0),), -1, dtype=torch.long, device=residues_to_keep.device)
+    if residues_to_keep.any():
+        old_to_new[residues_to_keep] = torch.arange(int(residues_to_keep.sum().item()), device=residues_to_keep.device)
+    complex_graph['receptor'].old_to_new = old_to_new
 
     if all_atoms:
         #print(complex_graph['atom'].x.shape, complex_graph['atom'].pos.shape, complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index.shape)
         atom_to_res_mapping = complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index[1]
         atoms_to_keep = residues_to_keep[atom_to_res_mapping]
-        rec_remapper = (torch.cumsum(residues_to_keep.long(), dim=0) - 1)
-        atom_to_res_new_mapping = rec_remapper[atom_to_res_mapping][atoms_to_keep]
+        atom_to_res_new_mapping = old_to_new[atom_to_res_mapping][atoms_to_keep]
         atom_res_edge_index = torch.stack([torch.arange(len(atom_to_res_new_mapping), device=atom_to_res_new_mapping.device), atom_to_res_new_mapping])
 
     complex_graph['receptor'].pos = complex_graph['receptor'].pos[residues_to_keep]
@@ -411,3 +414,19 @@ def crop_beyond(complex_graph, cutoff, all_atoms):
         complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
 
     #print("cropped", 1-torch.mean(residues_to_keep.float()), 'residues', 1-torch.mean(atoms_to_keep.float()), 'atoms')
+
+
+def remap_edge_index(edge_index: Tensor, old_to_new: Tensor):
+    if old_to_new is None:
+        return edge_index, None
+    if not torch.is_tensor(old_to_new):
+        old_to_new = torch.as_tensor(old_to_new, dtype=torch.long)
+    if edge_index.numel() == 0:
+        return edge_index, edge_index.new_zeros((0,), dtype=torch.bool)
+    old_to_new = old_to_new.to(edge_index.device)
+    remapped_rec = old_to_new[edge_index[1]]
+    valid_edges = remapped_rec >= 0
+    if not torch.any(valid_edges):
+        return edge_index.new_empty((2, 0)), valid_edges
+    edge_index = torch.stack([edge_index[0][valid_edges], remapped_rec[valid_edges]], dim=0)
+    return edge_index, valid_edges
