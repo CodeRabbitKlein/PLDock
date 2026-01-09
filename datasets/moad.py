@@ -1,5 +1,6 @@
 import os
 import pickle
+import warnings
 from multiprocessing import Pool
 import random
 import copy
@@ -15,7 +16,7 @@ from torch_geometric.utils import subgraph
 from tqdm import tqdm
 confProDy(verbosity='none')
 from datasets.process_mols import get_lig_graph_with_matching, moad_extract_receptor_structure
-from utils.utils import read_strings_from_txt
+from utils.utils import read_strings_from_txt, remap_edge_index
 
 class MOAD(Dataset):
     def __init__(self, root, transform=None, cache_path='data/cache', split='train', limit_complexes=0, chain_cutoff=None,
@@ -303,7 +304,11 @@ class MOAD(Dataset):
         if self.nci_cache_path is None:
             _cleanup_edge_store()
             return
-        nci_labels = self._load_nci_labels(ligand_name)
+        complex_name = complex_graph['name'] if 'name' in complex_graph else ligand_name
+        if complex_name is None:
+            _cleanup_edge_store()
+            return
+        nci_labels = self._load_nci_labels(str(complex_name))
         if nci_labels is None:
             _cleanup_edge_store()
             return
@@ -327,6 +332,17 @@ class MOAD(Dataset):
         cache_res_pos = nci_labels.get("res_pos")
         cache_res_chain_ids = nci_labels.get("res_chain_ids")
         cache_resnums = nci_labels.get("resnums")
+        num_rec = complex_graph['receptor'].num_nodes
+        min_cache_ratio = 0.6
+        min_hit_ratio = 0.6
+        min_coverage_ratio = 0.6
+        def _warn_skip(reason):
+            warnings.warn(
+                "[NCI cache] {name}: {reason}. Skipping cached NCI labels.".format(
+                    name=complex_name,
+                    reason=reason,
+                )
+            )
         if cache_res_chain_ids is not None and cache_resnums is not None:
             if isinstance(cache_res_chain_ids, np.ndarray):
                 cache_res_chain_ids = cache_res_chain_ids.tolist()
@@ -334,6 +350,21 @@ class MOAD(Dataset):
                 cache_resnums = cache_resnums.tolist()
             cache_res_chain_ids = [str(chain) for chain in cache_res_chain_ids]
             cache_resnums = [int(resnum) for resnum in cache_resnums]
+            if len(cache_resnums) == 0 or num_rec == 0:
+                _warn_skip("empty cache or receptor nodes")
+                _cleanup_edge_store()
+                return
+            size_ratio = min(len(cache_resnums), num_rec) / max(len(cache_resnums), num_rec)
+            if size_ratio < min_cache_ratio:
+                _warn_skip(
+                    "cache size mismatch cache_res={cache} graph_res={graph} ratio={ratio:.2f}".format(
+                        cache=len(cache_resnums),
+                        graph=num_rec,
+                        ratio=size_ratio,
+                    )
+                )
+                _cleanup_edge_store()
+                return
 
             curr_resnums = complex_graph['receptor'].resnums
             curr_res_chain_ids = complex_graph['receptor'].res_chain_ids
@@ -353,6 +384,25 @@ class MOAD(Dataset):
                 mapped = current_map.get((chain, resnum))
                 if mapped is not None:
                     remap[idx] = mapped
+            mapped_mask = remap >= 0
+            hit_count = int(mapped_mask.sum().item())
+            hit_ratio = hit_count / len(cache_resnums)
+            unique_mapped = int(torch.unique(remap[mapped_mask]).numel())
+            coverage_ratio = unique_mapped / num_rec
+            if hit_ratio < min_hit_ratio or coverage_ratio < min_coverage_ratio:
+                _warn_skip(
+                    "low cache mapping hit_rate={hit:.2f} ({hit_count}/{total}) coverage={cov:.2f} "
+                    "({unique}/{total_rec})".format(
+                        hit=hit_ratio,
+                        hit_count=hit_count,
+                        total=len(cache_resnums),
+                        cov=coverage_ratio,
+                        unique=unique_mapped,
+                        total_rec=num_rec,
+                    )
+                )
+                _cleanup_edge_store()
+                return
             remapped_rec = remap[edge_index[1]]
             valid_edges = remapped_rec >= 0
             edge_index = torch.stack([edge_index[0], remapped_rec], dim=0)[:, valid_edges]
@@ -377,8 +427,15 @@ class MOAD(Dataset):
                     edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
                 if edge_dist is not None:
                     edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
+        old_to_new = getattr(complex_graph['receptor'], "old_to_new", None)
+        if old_to_new is not None:
+            edge_index, valid_edges = remap_edge_index(edge_index, old_to_new)
+            if valid_edges is not None:
+                if edge_type is not None:
+                    edge_type = torch.as_tensor(edge_type, dtype=torch.long)[valid_edges]
+                if edge_dist is not None:
+                    edge_dist = torch.as_tensor(edge_dist, dtype=torch.float32)[valid_edges]
         num_lig = complex_graph['ligand'].num_nodes
-        num_rec = complex_graph['receptor'].num_nodes
         valid_edges = (
             (edge_index[0] >= 0)
             & (edge_index[0] < num_lig)
@@ -397,6 +454,8 @@ class MOAD(Dataset):
             nci_edge.edge_type_y = torch.as_tensor(edge_type, dtype=torch.long)
         if edge_dist is not None:
             nci_edge.edge_dist_y = torch.as_tensor(edge_dist, dtype=torch.float32)
+        if hasattr(complex_graph['receptor'], "old_to_new"):
+            delattr(complex_graph['receptor'], "old_to_new")
 
     def _load_nci_labels(self, ligand_name):
         if self.nci_cache_path is None:
@@ -413,6 +472,29 @@ class MOAD(Dataset):
                     data = np.load(path, allow_pickle=True)
                     return {key: data[key] for key in data.files}
         return None
+
+    def _has_nci_labels(self, ligand_name):
+        if self.nci_cache_path is None:
+            return False
+        candidates = []
+        if ligand_name:
+            candidates.extend([ligand_name, ligand_name[:4], ligand_name[:6]])
+        for candidate in dict.fromkeys(candidates):
+            for ext in (".pt", ".npz"):
+                path = os.path.join(self.nci_cache_path, f"{candidate}{ext}")
+                if os.path.exists(path):
+                    return True
+        return False
+
+    def _report_nci_stats_once(self, complex_names):
+        if self.nci_cache_path is None:
+            return
+        if getattr(self, "_nci_stats_reported", False):
+            return
+        self._nci_stats_reported = True
+        total = len(complex_names)
+        found = sum(1 for name in complex_names if self._has_nci_labels(name))
+        print(f'NCI labels available for {found}/{total} complexes in {self.nci_cache_path}')
 
     def preprocessing_receptors(self):
         print(f'Processing receptors from [{self.split}] and saving it to [{self.prot_cache_path}]')
